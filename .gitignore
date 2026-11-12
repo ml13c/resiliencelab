@@ -2,8 +2,6 @@
 /hello
 *.o
 traces/**/*.txt
-/CLAUDE.md
-/_private/
 __pycache__/
 *.pyc
 .pytest_cache/
