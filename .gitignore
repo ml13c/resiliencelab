@@ -1,0 +1,4 @@
+/ipc_probe
+/hello
+*.o
+traces/**/*.txt
