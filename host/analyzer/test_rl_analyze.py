@@ -37,6 +37,8 @@ class KillCheckRegression(unittest.TestCase):
         self.assertEqual(self.res.n_markers, 80)
         self.assertEqual([r.rid for r in self.res.rows], list(range(1, 21)))
         self.assertEqual(self.res.warnings, [])
+        self.assertEqual(self.res.notes, [])
+        self.assertEqual({r.status for r in self.res.rows}, {"ok"})
 
     def test_request1_regression_values(self):
         r = self.res.rows[0]
@@ -167,21 +169,6 @@ class SyntheticParser(unittest.TestCase):
         mk = res.rows[0].m[rl.REQ_START]
         self.assertIn("EVENT:100", text_lines[mk.lineno - 1])
 
-    def test_missing_marker_warns_and_exit_1(self):
-        text = scenario(skip=(103,))
-        res = run(text)
-        self.assertTrue(any("missing marker(s) 103" in w for w in res.warnings), res.warnings)
-        self.assertIsNone(res.rows[0].total)
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "t.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(text)
-            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
-                self.assertEqual(rl.main([p]), 1)
-            row = out.getvalue().splitlines()[-1].split()
-            # reply_us, total_us and the 103 cpu print as '-'
-            self.assertEqual(row[-3:], ["-", "-", "0,1,1,-"])
-
     def test_out_of_order_warns(self):
         res = run(scenario(swap_101_102=True))
         self.assertTrue(any("out of order" in w for w in res.warnings), res.warnings)
@@ -208,6 +195,99 @@ class SyntheticParser(unittest.TestCase):
     def test_missing_cycles_per_sec_is_fatal(self):
         with self.assertRaises(rl.TraceError):
             run(" -- KERNEL EVENTS -- \n" + mark(5, 0, 100, 1))
+
+
+def run_main(text):
+    """Run the CLI on `text`; returns (exit code, stdout, stderr)."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "t.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            code = rl.main([p])
+    return code, out.getvalue(), err.getvalue()
+
+
+def warned(res, text):
+    return any(text in w for w in res.warnings)
+
+
+def line_of(text, line):
+    """1-based line number of `line` in `text` (computed, not counted by hand)."""
+    return text.splitlines().index(line.rstrip("\n")) + 1
+
+
+class SyntheticCutOff(unittest.TestCase):
+    """Missing markers: the capture ended (note, exit 0) vs markers lost (warning, exit 1)."""
+
+    def test_last_request_cut_off_is_a_note_not_a_warning(self):
+        text = scenario(skip=(103,))     # trace stops while the client waits for its reply
+        res = run(text)
+        self.assertEqual(res.warnings, [])
+        self.assertEqual(res.rows[0].status, "cut off")
+        self.assertIsNone(res.rows[0].total)
+        code, out, err = run_main(text)
+        self.assertEqual(code, 0)
+        # reply_us, total_us and the 103 cpu print as '-'
+        self.assertEqual(out.splitlines()[-1].split()[-5:], ["-", "-", "0,1,1,-", "cut", "off"])
+        # Last event is THRECEIVE at t=534, last marker 102 at t=530: 4 ticks = 4 us.
+        self.assertIn("note: req 1: cut off at trace end (missing 103); "
+                      "the capture ended 4.0 us after marker 102", err)
+
+    def test_cut_off_right_after_start(self):
+        res = run(scenario(skip=(101, 102, 103)))
+        self.assertEqual((res.warnings, res.rows[0].status), ([], "cut off"))
+
+    def test_later_request_from_same_client_means_markers_were_lost(self):
+        # MsgSend blocks, so request 2 can only start after request 1 got its reply.
+        req2 = mark(30, 0, 100, 2)
+        text = START + th(10, 0, "THRUNNING", *CLIENT, 30) + mark(20, 0, 100, 1) + req2
+        res = run(text)
+        r1, r2 = res.rows
+        self.assertEqual((r1.status, r2.status), ("incomplete", "cut off"))
+        self.assertTrue(warned(res, "req 1: missing marker(s) 101, 102, 103 (client 100/1@30 "
+                                    f"started request 2 later (line {line_of(text, req2)}))"),
+                        res.warnings)
+        self.assertEqual(run_main(text)[0], 1)
+
+    def test_client_died_is_not_cut_off(self):
+        death = ev(30, 0, "THREAD", "THDESTROY", "pid:100 tid:1")   # no priority field, as on the Pi
+        text = START + th(10, 0, "THRUNNING", *CLIENT, 30) + mark(20, 0, 100, 1) + death
+        res = run(text)
+        self.assertEqual(res.rows[0].status, "incomplete")
+        self.assertTrue(warned(res, f"client 100/1@30 died at line {line_of(text, death)}"),
+                        res.warnings)
+
+    def test_gap_in_the_middle_is_not_cut_off(self):
+        res = run(scenario(skip=(101,)))
+        self.assertEqual(res.rows[0].status, "incomplete")
+        self.assertTrue(warned(res, "missing marker(s) 101 (markers missing before later ones)"),
+                        res.warnings)
+
+    def test_no_start_marker_is_not_cut_off(self):
+        res = run(scenario(skip=(100,)))
+        self.assertEqual(res.rows[0].status, "incomplete")
+        self.assertTrue(warned(res, "no start marker"), res.warnings)
+
+    def test_other_warning_gives_status_check(self):
+        self.assertEqual(run(scenario(d1=10)).rows[0].status, "check")
+
+
+class SyntheticEmpty(unittest.TestCase):
+    def test_no_events_recognised_warns_and_exit_1(self):
+        text = scenario().replace(" CPU:", "  CPU:")   # a layout the event regex rejects
+        res = run(text)
+        self.assertEqual((res.n_events, res.rows), (0, []))
+        self.assertTrue(warned(res, "no trace events recognised"), res.warnings)
+        self.assertEqual(run_main(text)[0], 1)
+
+    def test_events_but_no_probe_markers_warns(self):
+        text = START + th(10, 0, "THRUNNING", *CLIENT, 30) + mark(20, 0, 7, 1)   # foreign code 7
+        res = run(text)
+        self.assertEqual((res.n_markers, res.rows), (0, []))
+        self.assertTrue(warned(res, "no ipc_probe markers (user events 100-103) found"),
+                        res.warnings)
+        self.assertEqual(run_main(text)[0], 1)
 
 
 # The counter's low 32 bits wrap at rel. tick 256 (0xFFFFFF00 + 0x100): after

@@ -13,6 +13,8 @@ in analyze()).
 
 Usage:  python rl_analyze.py <traceprinter.txt>
 Exit:   0 = clean, 1 = warnings (printed to stderr), 2 = fatal (bad input).
+        A request the capture ended before it finished gets status "cut off" and
+        a note on stderr; that alone is not a warning.
 Stdlib only, Python 3.12.
 """
 from __future__ import annotations
@@ -86,6 +88,8 @@ class Row:
     """One request: the first marker seen for each code."""
     rid: int
     m: dict[int, Marker]
+    # ok | cut off (capture ended first) | incomplete (markers lost) | check (other warning)
+    status: str = "ok"
 
     def ticks(self, a: int, b: int) -> int | None:
         if a in self.m and b in self.m:
@@ -120,8 +124,26 @@ class Result:
     n_events: int = 0
     n_markers: int = 0
     n_wraps: int = 0              # 32-bit wraps inferred between CONTROL TIME events
+    t_end: int | None = None      # timestamp of the last event: where the capture ends
     rows: list[Row] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)   # make the exit code 1
+    notes: list[str] = field(default_factory=list)      # information only
+
+
+ThreadKey = tuple[int, int]   # (pid, tid)
+
+
+@dataclass
+class _Ctx:
+    """Whole-trace facts the per-request checks need."""
+    res: Result
+    flagged: set[int] = field(default_factory=set)                    # request ids with a warning
+    by_thread: dict[ThreadKey, list[Marker]] = field(default_factory=dict)  # markers per emitter, time order
+    died: dict[ThreadKey, tuple[int, int]] = field(default_factory=dict)    # (t, lineno) of THDEAD/THDESTROY
+
+    def warn(self, rid: int, msg: str) -> None:
+        self.res.warnings.append(f"req {rid}: {msg}")
+        self.flagged.add(rid)
 
 
 def parse_header(numbered: Iterator[tuple[int, str]]) -> dict[str, str]:
@@ -222,6 +244,7 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
         raise TraceError(f"TRACE_CYCLES_PER_SEC is {cps}")
     res = Result(source, header, cps)
     warn = res.warnings.append
+    ctx = _Ctx(res)
 
     # running[cpu] = the thread the kernel last dispatched on that CPU (or None).
     # A CPU runs one thread at a time, and TraceEvent() is a kernel call made
@@ -236,6 +259,7 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
     for ev in iter_events(numbered):
         ev = ev._replace(t=clock.full(ev))   # from here on, t is a full 64-bit tick count
         res.n_events += 1
+        res.t_end = ev.t if res.t_end is None else max(res.t_end, ev.t)
         # running[cpu] is only right if each CPU's events arrive in time order.
         if ev.t < last_t.get(ev.cpu, ev.t):
             warn(f"line {ev.lineno}: CPU {ev.cpu} timestamp went backwards")
@@ -260,6 +284,8 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
                 cur = running.get(ev.cpu)
                 if cur is not None and (cur.pid, cur.tid) == (th.pid, th.tid):
                     running[ev.cpu] = None
+                if ev.name in ("THDEAD", "THDESTROY"):   # used to tell "killed" from "cut off"
+                    ctx.died.setdefault((th.pid, th.tid), (ev.t, ev.lineno))
 
         elif ev.cls == "USREVENT":
             lineno = ev.lineno
@@ -275,11 +301,20 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
                         running.get(ev.cpu), lineno)
             res.n_markers += 1
             if mk.thread is None:
-                warn(f"req {mk.rid}: marker {code} (line {lineno}) on CPU {ev.cpu} has "
-                     f"unknown emitter (no thread known to be running there)")
+                ctx.warn(mk.rid, f"marker {code} (line {lineno}) on CPU {ev.cpu} has "
+                                 f"unknown emitter (no thread known to be running there)")
+            else:
+                ctx.by_thread.setdefault((mk.thread.pid, mk.thread.tid), []).append(mk)
             by_req.setdefault(mk.rid, {}).setdefault(code, []).append(mk)
 
     res.n_wraps = clock.n_wraps
+    # An empty table with exit 0 would look like "all good"; say why it is empty.
+    if res.n_events == 0:
+        warn("no trace events recognised: is this traceprinter output with lines like "
+             "'t:0x<ticks> CPU:<n> <CLASS> :<EVENT> ...'?")
+    elif res.n_markers == 0:
+        warn("no ipc_probe markers (user events 100-103) found: "
+             "was the probe running during the capture?")
     if no_prio:
         warn(f"{no_prio} THRUNNING events without priority: was the trace captured with -w?")
     if unknown_codes:
@@ -287,30 +322,71 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
         warn(f"ignored user events with non-probe codes: {codes}")
 
     for rid in sorted(by_req):
-        res.rows.append(_check_request(rid, by_req[rid], warn))
+        res.rows.append(_check_request(rid, by_req[rid], ctx))
     return res
 
 
-def _check_request(rid: int, got: dict[int, list[Marker]], warn) -> Row:
+def _why_not_cut_off(row: Row, ctx: _Ctx) -> str | None:
+    """None if the capture ending explains the missing markers, else the reason it doesn't.
+
+    A request counts as cut off at the trace end only when all of these hold:
+    - it has its start (100) and only its LAST markers are missing (e.g. 100 101,
+      no 102 103), as when the capture stops while the request is in flight;
+    - its client thread starts no later request. MsgSend blocks until the reply,
+      so a later request from the same thread proves this one finished inside
+      the capture: its missing markers were lost, not cut off;
+    - its client thread did not die (slay, crash) after starting it.
+    """
+    present = [c for c in MARKER_CODES if c in row.m]
+    if REQ_START not in row.m:
+        return "no start marker; the capture may have begun mid-request"
+    if present != list(MARKER_CODES[:len(present)]):
+        return "markers missing before later ones"
+    client = row.thread(REQ_START)
+    if client is None:
+        return "client thread unknown"
+    key, t0 = (client.pid, client.tid), row.m[REQ_START].t
+    later = next((mk for mk in ctx.by_thread.get(key, []) if mk.t > t0 and mk.rid != row.rid), None)
+    if later:
+        return f"client {client.label()} started request {later.rid} later (line {later.lineno})"
+    death = ctx.died.get(key)
+    if death and death[0] > t0:
+        return f"client {client.label()} died at line {death[1]}"
+    return None
+
+
+def _check_request(rid: int, got: dict[int, list[Marker]], ctx: _Ctx) -> Row:
+    def warn(msg: str) -> None:
+        ctx.warn(rid, msg)
+
     for code, lst in got.items():
         if len(lst) > 1:
             lines = ", ".join(str(mk.lineno) for mk in lst)
-            warn(f"req {rid}: marker {code} appears {len(lst)} times (lines {lines}); using the first")
+            warn(f"marker {code} appears {len(lst)} times (lines {lines}); using the first")
     row = Row(rid, {code: lst[0] for code, lst in got.items()})
 
     missing = [c for c in MARKER_CODES if c not in row.m]
     if missing:
-        warn(f"req {rid}: missing marker(s) {', '.join(map(str, missing))}")
+        names = ", ".join(map(str, missing))
+        why_not = _why_not_cut_off(row, ctx)
+        if why_not is None:
+            row.status = "cut off"
+            last = max(row.m.values(), key=lambda mk: mk.t)
+            ctx.res.notes.append(
+                f"req {rid}: cut off at trace end (missing {names}); the capture ended "
+                f"{fmt_us(ctx.res.t_end - last.t, ctx.res.cps)} us after marker {last.code}")
+        else:
+            warn(f"missing marker(s) {names} ({why_not})")
 
     present = [c for c in MARKER_CODES if c in row.m]
     order = sorted(present, key=lambda c: (row.m[c].t, c))
     if order != present:
-        warn(f"req {rid}: markers out of order in time: {' '.join(map(str, order))}")
+        warn(f"markers out of order in time: {' '.join(map(str, order))}")
 
     def same(a: int, b: int, who: str) -> None:
         ta, tb = row.thread(a), row.thread(b)
         if ta and tb and (ta.pid, ta.tid) != (tb.pid, tb.tid):
-            warn(f"req {rid}: {who} thread differs: {a} from {ta.label()}, {b} from {tb.label()}")
+            warn(f"{who} thread differs: {a} from {ta.label()}, {b} from {tb.label()}")
 
     same(REQ_START, REQ_END, "client")
     same(SRV_GOT, SRV_REPLY, "server")
@@ -319,8 +395,11 @@ def _check_request(rid: int, got: dict[int, list[Marker]], warn) -> Row:
     # priority the server read for itself inside the handler (d1 on 101).
     srv = row.thread(SRV_GOT)
     if srv and srv.prio is not None and srv.prio != row.m[SRV_GOT].d1:
-        warn(f"req {rid}: server self-reported priority {row.m[SRV_GOT].d1} "
+        warn(f"server self-reported priority {row.m[SRV_GOT].d1} "
              f"but kernel dispatched it at {srv.prio}")
+
+    if row.status != "cut off" and rid in ctx.flagged:
+        row.status = "incomplete" if missing else "check"
     return row
 
 
@@ -336,7 +415,8 @@ def print_table(res: Result, out=None) -> None:
           f"markers: {res.n_markers}  requests: {len(res.rows)}"
           + (f"  32-bit wraps rebuilt: {res.n_wraps}" if res.n_wraps else ""), file=out)
     cols = f"{'req':>4}  {'client(pid/tid@prio)':<22}{'server(pid/tid@prio)':<22}" \
-           f"{'srv_d1':>6}{'recv_us':>9}{'work_us':>9}{'reply_us':>9}{'total_us':>9}  cpus"
+           f"{'srv_d1':>6}{'recv_us':>9}{'work_us':>9}{'reply_us':>9}{'total_us':>9}  " \
+           f"{'cpus':<9}status"
     print(cols, file=out)
 
     def who(th: Thread | None) -> str:
@@ -349,7 +429,8 @@ def print_table(res: Result, out=None) -> None:
         cpus = ",".join(str(r.m[c].cpu) if c in r.m else "-" for c in MARKER_CODES)
         print(f"{r.rid:>4}  {who(cl):<22}{who(sv):<22}{d1:>6}"
               f"{fmt_us(r.recv, res.cps):>9}{fmt_us(r.work, res.cps):>9}"
-              f"{fmt_us(r.reply, res.cps):>9}{fmt_us(r.total, res.cps):>9}  {cpus}", file=out)
+              f"{fmt_us(r.reply, res.cps):>9}{fmt_us(r.total, res.cps):>9}  {cpus:<9}{r.status}",
+              file=out)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -364,6 +445,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"rl_analyze: error: {e}", file=sys.stderr)
         return 2
     print_table(res)
+    for n in res.notes:
+        print(f"note: {n}", file=sys.stderr)
     for w in res.warnings:
         print(f"warning: {w}", file=sys.stderr)
     return 1 if res.warnings else 0
