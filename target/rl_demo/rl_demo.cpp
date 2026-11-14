@@ -27,6 +27,7 @@
 //   q++ -Vgcc_ntoaarch64le -O2 -Wall target\rl_demo\rl_demo.cpp -o rl_demo
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -265,8 +266,21 @@ static uint64_t mono_ns() {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+// Timers normally expire on the 1 ms clock tick. The aligned capture
+// (2026-11-13) showed timer interrupts at exact multiples of 1000 us, and each
+// run's "release delay" was a constant 38-815 us: tick quantization, not
+// waiting. TIMER_PRECISE asks for a high-resolution timer instead. If this
+// system rejects the flag, fall back to tick timing (once, with a message).
+static std::atomic<bool> g_precise{true};
+
 static void sleep_until_ns(uint64_t t) {
     timespec ts{(time_t)(t / 1000000000ULL), (long)(t % 1000000000ULL)};
+    if (g_precise) {
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME | TIMER_PRECISE, &ts, nullptr);
+        if (rc != EINVAL) return;                  // clock_nanosleep returns the error number
+        if (g_precise.exchange(false))
+            fprintf(stderr, "clock_nanosleep: TIMER_PRECISE rejected, using tick timing\n");
+    }
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
 }
 
@@ -291,6 +305,13 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
     uint64_t release = mono_ns();
     uint32_t skipped = 0;
 
+    // Per-request results are kept in memory and printed after the loop. Printing
+    // inside the loop wrote to the log file on the SD card, and once a write
+    // REPLY-blocked the client in devb-sdmmc for 163 ms (28 releases skipped in
+    // the aligned 'fixed' capture). No file I/O while measuring.
+    struct Rec { uint32_t seq; double us; bool late, ok; int err; };
+    std::vector<Rec> recs;
+    recs.reserve(count);
     std::vector<double> lat, rel;
     lat.reserve(count);
     rel.reserve(count);
@@ -321,8 +342,7 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
         lat.push_back(us);
         correct += ok;
         late += is_late;
-        printf("req %u:%-4u %9.1f us%s%s%s%s\n", index, seq, us, is_late ? "  LATE" : "",
-               ok ? "" : "  WRONG", err ? "  " : "", err ? strerror(err) : "");
+        recs.push_back(Rec{seq, us, is_late, ok, err});
         release += period_ns;
         const uint64_t now = mono_ns();
         while (release <= now) { release += period_ns; ++skipped; }   // overran: skip
@@ -330,7 +350,11 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
     }
     name_close(coid);
 
+    for (const Rec& r : recs)
+        printf("req %u:%-4u %9.1f us%s%s%s%s\n", index, r.seq, r.us, r.late ? "  LATE" : "",
+               r.ok ? "" : "  WRONG", r.err ? "  " : "", r.err ? strerror(r.err) : "");
     std::sort(lat.begin(), lat.end());
+    printf("timers: %s\n", g_precise ? "precise (TIMER_PRECISE)" : "tick (1 ms)");
     printf("releases skipped (previous request overran its period): %u\n", skipped);
     printf("functional: %u/%u correct\n", correct, count);
     printf("deadline %u us: %u/%u late (client-measured)\n", deadline_us, late, count);

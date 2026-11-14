@@ -62,7 +62,7 @@ run_one() {
         mv $ram $OUT/$name.kev
         $B/traceprinter -f $OUT/$name.kev > $OUT/$name.txt
     fi
-    tail -n 5 $OUT/$name.client.log
+    tail -n 6 $OUT/$name.client.log
     echo "   client exit $rc, trace $(wc -c < $OUT/$name.kev 2>/dev/null || echo 0) bytes"
 }
 

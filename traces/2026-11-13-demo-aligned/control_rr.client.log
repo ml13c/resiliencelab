@@ -1,0 +1,206 @@
+client 0: pid 17023034 priority 30, 200 requests, work 500 us, period 7 ms (fixed rate), deadline 2000 us
+req 0:1        528.7 us
+req 0:2       1658.8 us
+req 0:3       1926.4 us
+req 0:4        518.1 us
+req 0:5       2167.7 us  LATE
+req 0:6       2992.5 us  LATE
+req 0:7       2002.0 us  LATE
+req 0:8        515.4 us
+req 0:9       2995.0 us  LATE
+req 0:10      3003.9 us  LATE
+req 0:11       515.0 us
+req 0:12      1991.6 us
+req 0:13      1998.2 us
+req 0:14       516.2 us
+req 0:15      1660.7 us
+req 0:16      2000.4 us  LATE
+req 0:17      2069.6 us  LATE
+req 0:18      1178.5 us
+req 0:19      2654.5 us  LATE
+req 0:20      3002.9 us  LATE
+req 0:21       516.5 us
+req 0:22      2654.1 us  LATE
+req 0:23      3001.4 us  LATE
+req 0:24       523.1 us
+req 0:25      1659.6 us
+req 0:26      1992.7 us
+req 0:27      4003.7 us  LATE
+req 0:28      1174.7 us
+req 0:29      2920.1 us  LATE
+req 0:30      3003.6 us  LATE
+req 0:31       515.4 us
+req 0:32      2652.0 us  LATE
+req 0:33      3002.1 us  LATE
+req 0:34       515.6 us
+req 0:35      1659.5 us
+req 0:36      2004.6 us  LATE
+req 0:37      3003.8 us  LATE
+req 0:38      1174.5 us
+req 0:39      1993.3 us
+req 0:40      2002.9 us  LATE
+req 0:41       523.1 us
+req 0:42      1660.6 us
+req 0:43      2001.2 us  LATE
+req 0:44       517.9 us
+req 0:45      2167.2 us  LATE
+req 0:46      2995.3 us  LATE
+req 0:47      2995.6 us  LATE
+req 0:48      1175.7 us
+req 0:49      3655.5 us  LATE
+req 0:50      4003.8 us  LATE
+req 0:51       517.7 us
+req 0:52      1659.3 us
+req 0:53      2074.1 us  LATE
+req 0:54       518.1 us
+req 0:55      2167.5 us  LATE
+req 0:56      2993.8 us  LATE
+req 0:57      2996.3 us  LATE
+req 0:58      1174.3 us
+req 0:59      2996.2 us  LATE
+req 0:60      3002.3 us  LATE
+req 0:61       517.8 us
+req 0:62      2651.7 us  LATE
+req 0:63      3002.6 us  LATE
+req 0:64       517.9 us
+req 0:65      1659.0 us
+req 0:66      2000.8 us  LATE
+req 0:67      1993.9 us
+req 0:68       517.8 us
+req 0:69      2653.2 us  LATE
+req 0:70      3996.3 us  LATE
+req 0:71       519.5 us
+req 0:72      2657.1 us  LATE
+req 0:73      3995.8 us  LATE
+req 0:74       519.2 us
+req 0:75      1166.6 us
+req 0:76      3657.4 us  LATE
+req 0:77      3999.5 us  LATE
+req 0:78       519.6 us
+req 0:79      3653.5 us  LATE
+req 0:80      4003.7 us  LATE
+req 0:81       516.9 us
+req 0:82      2167.9 us  LATE
+req 0:83      3994.2 us  LATE
+req 0:84       518.0 us
+req 0:85      2166.4 us  LATE
+req 0:86      3997.1 us  LATE
+req 0:87      3994.3 us  LATE
+req 0:88      1105.8 us
+req 0:89      3652.9 us  LATE
+req 0:90      4004.2 us  LATE
+req 0:91       516.0 us
+req 0:92      1661.5 us
+req 0:93      2010.1 us  LATE
+req 0:94       518.4 us
+req 0:95      2168.9 us  LATE
+req 0:96      2995.6 us  LATE
+req 0:97      2993.9 us  LATE
+req 0:98      1174.1 us
+req 0:99      3654.1 us  LATE
+req 0:100     3999.9 us  LATE
+req 0:101      517.9 us
+req 0:102     2168.4 us  LATE
+req 0:103     3997.1 us  LATE
+req 0:104      515.5 us
+req 0:105     2168.3 us  LATE
+req 0:106     3994.7 us  LATE
+req 0:107     3998.3 us  LATE
+req 0:108      520.0 us
+req 0:109     2992.7 us  LATE
+req 0:110     2930.7 us  LATE
+req 0:111      518.0 us
+req 0:112     2654.1 us  LATE
+req 0:113     2929.6 us  LATE
+req 0:114      518.5 us
+req 0:115     1660.0 us
+req 0:116     1999.9 us
+req 0:117     1995.5 us
+req 0:118      518.7 us
+req 0:119     1994.8 us
+req 0:120     2620.1 us  LATE
+req 0:121      515.6 us
+req 0:122     2654.0 us  LATE
+req 0:123     3000.4 us  LATE
+req 0:124      516.9 us
+req 0:125     1659.1 us
+req 0:126     2995.6 us  LATE
+req 0:127     3003.3 us  LATE
+req 0:128      519.8 us
+req 0:129     1994.6 us
+req 0:130     1999.4 us
+req 0:131      518.4 us
+req 0:132     2164.4 us  LATE
+req 0:133     3995.9 us  LATE
+req 0:134      516.4 us
+req 0:135     2166.5 us  LATE
+req 0:136     3997.4 us  LATE
+req 0:137     3992.8 us  LATE
+req 0:138     1178.6 us
+req 0:139     3656.2 us  LATE
+req 0:140     4003.2 us  LATE
+req 0:141      516.5 us
+req 0:142     1660.2 us
+req 0:143     1994.9 us
+req 0:144      515.0 us
+req 0:145     2165.2 us  LATE
+req 0:146     2996.4 us  LATE
+req 0:147     2004.3 us  LATE
+req 0:148     1172.6 us
+req 0:149     2992.3 us  LATE
+req 0:150     3002.9 us  LATE
+req 0:151      518.1 us
+req 0:152     2654.8 us  LATE
+req 0:153     3010.6 us  LATE
+req 0:154      514.9 us
+req 0:155     1661.4 us
+req 0:156     1998.9 us
+req 0:157     1994.1 us
+req 0:158      518.4 us
+req 0:159     2652.6 us  LATE
+req 0:160     5657.8 us  LATE
+req 0:161      517.9 us
+req 0:162     2654.7 us  LATE
+req 0:163     3996.7 us  LATE
+req 0:164      517.9 us
+req 0:165     1165.3 us
+req 0:166     3656.2 us  LATE
+req 0:167     2995.1 us  LATE
+req 0:168     1174.0 us
+req 0:169     2992.0 us  LATE
+req 0:170     3004.4 us  LATE
+req 0:171      518.4 us
+req 0:172     2654.0 us  LATE
+req 0:173     3005.1 us  LATE
+req 0:174      517.9 us
+req 0:175     1658.8 us
+req 0:176     2002.1 us  LATE
+req 0:177     3001.8 us  LATE
+req 0:178     1177.4 us
+req 0:179     1992.3 us
+req 0:180     2001.7 us  LATE
+req 0:181      518.3 us
+req 0:182     1660.0 us
+req 0:183     1999.4 us
+req 0:184      517.7 us
+req 0:185     2164.2 us  LATE
+req 0:186     2996.1 us  LATE
+req 0:187     2998.1 us  LATE
+req 0:188     1172.5 us
+req 0:189     3656.2 us  LATE
+req 0:190     4002.7 us  LATE
+req 0:191      514.1 us
+req 0:192     1659.8 us
+req 0:193     2002.8 us  LATE
+req 0:194      517.9 us
+req 0:195     2166.6 us  LATE
+req 0:196     2994.6 us  LATE
+req 0:197     2001.2 us  LATE
+req 0:198      520.2 us
+req 0:199     2992.7 us  LATE
+req 0:200     3003.3 us  LATE
+releases skipped (previous request overran its period): 0
+functional: 200/200 correct
+deadline 2000 us: 107/200 late (client-measured)
+latency us: min 514.1  median 2002.8  max 5657.8
+release delay us (scheduled release -> send): median 136.6  max 2134.8

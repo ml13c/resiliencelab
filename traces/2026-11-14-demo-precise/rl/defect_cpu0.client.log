@@ -1,0 +1,207 @@
+client 0: pid 17752122 priority 30, 200 requests, work 500 us, period 7 ms (fixed rate), deadline 2000 us
+req 0:1       7887.4 us  LATE
+req 0:2       3279.9 us  LATE
+req 0:3       6274.5 us  LATE
+req 0:4        509.5 us
+req 0:5       2274.1 us  LATE
+req 0:6       5207.3 us  LATE
+req 0:7       8282.5 us  LATE
+req 0:8       4281.5 us  LATE
+req 0:9       7275.9 us  LATE
+req 0:10      3281.4 us  LATE
+req 0:11      6276.4 us  LATE
+req 0:12       582.8 us
+req 0:13      2275.5 us  LATE
+req 0:14      5282.6 us  LATE
+req 0:15      8282.0 us  LATE
+req 0:16      4282.6 us  LATE
+req 0:17      7274.4 us  LATE
+req 0:18      3277.7 us  LATE
+req 0:19      6274.8 us  LATE
+req 0:20       509.6 us
+req 0:21      2276.7 us  LATE
+req 0:22      5283.1 us  LATE
+req 0:23      8282.6 us  LATE
+req 0:24      4282.4 us  LATE
+req 0:25      7289.8 us  LATE
+req 0:26      3281.0 us  LATE
+req 0:27      6274.8 us  LATE
+req 0:28       508.8 us
+req 0:29      2274.8 us  LATE
+req 0:30      5281.9 us  LATE
+req 0:31      8276.6 us  LATE
+req 0:32      4282.0 us  LATE
+req 0:33      7279.6 us  LATE
+req 0:34      3281.0 us  LATE
+req 0:35      6276.7 us  LATE
+req 0:36       510.1 us
+req 0:37      2281.7 us  LATE
+req 0:38      5282.4 us  LATE
+req 0:39      8281.7 us  LATE
+req 0:40      4282.3 us  LATE
+req 0:41      7280.0 us  LATE
+req 0:42      3279.5 us  LATE
+req 0:43      6276.1 us  LATE
+req 0:44       509.3 us
+req 0:45      2281.8 us  LATE
+req 0:46      5283.2 us  LATE
+req 0:47      8282.0 us  LATE
+req 0:48      4282.0 us  LATE
+req 0:49      7274.8 us  LATE
+req 0:50      3282.6 us  LATE
+req 0:51      6276.2 us  LATE
+req 0:52       581.2 us
+req 0:53      2276.1 us  LATE
+req 0:54      5281.9 us  LATE
+req 0:55      8276.1 us  LATE
+req 0:56      4281.9 us  LATE
+req 0:57      7275.2 us  LATE
+req 0:58      3277.2 us  LATE
+req 0:59      6276.6 us  LATE
+req 0:60       509.0 us
+req 0:61      2280.4 us  LATE
+req 0:62      5281.7 us  LATE
+req 0:63      8277.7 us  LATE
+req 0:64      4281.5 us  LATE
+req 0:65      7273.2 us  LATE
+req 0:66      3277.1 us  LATE
+req 0:67      6263.1 us  LATE
+req 0:68       508.9 us
+req 0:69      2273.5 us  LATE
+req 0:70      5282.1 us  LATE
+req 0:71      8285.6 us  LATE
+req 0:72      4282.1 us  LATE
+req 0:73      7273.7 us  LATE
+req 0:74      3278.0 us  LATE
+req 0:75      6275.6 us  LATE
+req 0:76       508.9 us
+req 0:77      2274.9 us  LATE
+req 0:78      5282.4 us  LATE
+req 0:79      8275.5 us  LATE
+req 0:80      4282.8 us  LATE
+req 0:81      7275.4 us  LATE
+req 0:82      3277.7 us  LATE
+req 0:83      6281.2 us  LATE
+req 0:84       509.5 us
+req 0:85      2281.2 us  LATE
+req 0:86      5282.5 us  LATE
+req 0:87      8275.9 us  LATE
+req 0:88      4282.0 us  LATE
+req 0:89      7281.6 us  LATE
+req 0:90      3274.1 us  LATE
+req 0:91      6280.8 us  LATE
+req 0:92       509.1 us
+req 0:93      2275.7 us  LATE
+req 0:94      5282.3 us  LATE
+req 0:95      8276.2 us  LATE
+req 0:96      4282.5 us  LATE
+req 0:97      7208.6 us  LATE
+req 0:98      3274.4 us  LATE
+req 0:99      6276.4 us  LATE
+req 0:100      508.9 us
+req 0:101     2274.4 us  LATE
+req 0:102     5283.0 us  LATE
+req 0:103     8276.6 us  LATE
+req 0:104     4281.9 us  LATE
+req 0:105     7275.8 us  LATE
+req 0:106     3277.1 us  LATE
+req 0:107     6282.1 us  LATE
+req 0:108      583.2 us
+req 0:109     2281.6 us  LATE
+req 0:110     5282.7 us  LATE
+req 0:111     8277.8 us  LATE
+req 0:112     4282.7 us  LATE
+req 0:113     7275.8 us  LATE
+req 0:114     3287.9 us  LATE
+req 0:115     6280.6 us  LATE
+req 0:116      508.9 us
+req 0:117     2280.6 us  LATE
+req 0:118     5358.4 us  LATE
+req 0:119     8282.0 us  LATE
+req 0:120     4281.6 us  LATE
+req 0:121     7275.6 us  LATE
+req 0:122     3277.5 us  LATE
+req 0:123     6282.7 us  LATE
+req 0:124      510.0 us
+req 0:125     2280.4 us  LATE
+req 0:126     5282.6 us  LATE
+req 0:127     8276.8 us  LATE
+req 0:128     4281.8 us  LATE
+req 0:129     7281.5 us  LATE
+req 0:130     3278.6 us  LATE
+req 0:131     6276.1 us  LATE
+req 0:132      509.2 us
+req 0:133     2277.2 us  LATE
+req 0:134     5282.2 us  LATE
+req 0:135     8276.6 us  LATE
+req 0:136     4283.0 us  LATE
+req 0:137     7275.0 us  LATE
+req 0:138     3278.2 us  LATE
+req 0:139     6276.1 us  LATE
+req 0:140      509.5 us
+req 0:141     2282.6 us  LATE
+req 0:142     5282.1 us  LATE
+req 0:143     8277.4 us  LATE
+req 0:144     4282.5 us  LATE
+req 0:145     7277.2 us  LATE
+req 0:146     3282.3 us  LATE
+req 0:147     6281.9 us  LATE
+req 0:148      509.0 us
+req 0:149     2275.0 us  LATE
+req 0:150     5281.8 us  LATE
+req 0:151     8283.1 us  LATE
+req 0:152     4282.9 us  LATE
+req 0:153     7276.2 us  LATE
+req 0:154     3281.7 us  LATE
+req 0:155     6276.5 us  LATE
+req 0:156      508.9 us
+req 0:157     2277.2 us  LATE
+req 0:158     5282.6 us  LATE
+req 0:159     8281.7 us  LATE
+req 0:160     4282.4 us  LATE
+req 0:161     7274.9 us  LATE
+req 0:162     3277.4 us  LATE
+req 0:163     6280.9 us  LATE
+req 0:164      509.2 us
+req 0:165     2279.2 us  LATE
+req 0:166     5281.5 us  LATE
+req 0:167     8280.8 us  LATE
+req 0:168     4281.9 us  LATE
+req 0:169     7274.7 us  LATE
+req 0:170     3281.5 us  LATE
+req 0:171     6282.1 us  LATE
+req 0:172      508.8 us
+req 0:173     2280.1 us  LATE
+req 0:174     5282.1 us  LATE
+req 0:175     8282.5 us  LATE
+req 0:176     4282.6 us  LATE
+req 0:177     7203.7 us  LATE
+req 0:178     3281.5 us  LATE
+req 0:179     6276.8 us  LATE
+req 0:180      511.4 us
+req 0:181     2276.2 us  LATE
+req 0:182     5281.4 us  LATE
+req 0:183     8282.9 us  LATE
+req 0:184     4282.9 us  LATE
+req 0:185     7274.5 us  LATE
+req 0:186     3281.8 us  LATE
+req 0:187     6276.9 us  LATE
+req 0:188      508.9 us
+req 0:189     2274.0 us  LATE
+req 0:190     5282.3 us  LATE
+req 0:191     8239.2 us  LATE
+req 0:192     4284.3 us  LATE
+req 0:193     7281.1 us  LATE
+req 0:194     3280.6 us  LATE
+req 0:195     6276.5 us  LATE
+req 0:196      583.2 us
+req 0:197     2280.6 us  LATE
+req 0:198     5282.4 us  LATE
+req 0:199     8278.1 us  LATE
+req 0:200     4282.4 us  LATE
+timers: precise (TIMER_PRECISE)
+releases skipped (previous request overran its period): 50
+functional: 200/200 correct
+deadline 2000 us: 175/200 late (client-measured)
+latency us: min 508.8  median 5207.3  max 8285.6
+release delay us (scheduled release -> send): median 592.6  max 670.9
