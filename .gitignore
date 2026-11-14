@@ -6,3 +6,4 @@ traces/**/*.txt
 __pycache__/
 *.pyc
 .pytest_cache/
+traces/**/*.kev

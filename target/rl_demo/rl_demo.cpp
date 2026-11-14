@@ -291,8 +291,9 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
     uint64_t release = mono_ns();
     uint32_t skipped = 0;
 
-    std::vector<double> lat;
+    std::vector<double> lat, rel;
     lat.reserve(count);
+    rel.reserve(count);
     uint32_t correct = 0, late = 0;
     for (uint32_t seq = 1; seq <= count; ++seq) {
         const uint32_t id    = (index << 24) | seq;
@@ -300,6 +301,12 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
         Request req{kMsgType, 0, id, work_us, input};
         Reply   rep{};
 
+        // Release delay: how long after its scheduled release this request is
+        // actually sent. It is ~0 when the client outranks the load. When the load
+        // is at the client's own priority, the client itself can wait here. That
+        // wait comes before marker 100, so neither the latency below nor the
+        // trace's request interval includes it.
+        rel.push_back((double)(mono_ns() - release) / 1000.0);
         mark(EV_REQ_START, id, (int)deadline_us);
         uint64_t t0 = ClockCycles();
         // SEND-blocked until the server receives, then REPLY-blocked until it replies.
@@ -330,6 +337,10 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
     if (!lat.empty())
         printf("latency us: min %.1f  median %.1f  max %.1f\n",
                lat.front(), lat[lat.size() / 2], lat.back());
+    std::sort(rel.begin(), rel.end());
+    if (!rel.empty())
+        printf("release delay us (scheduled release -> send): median %.1f  max %.1f\n",
+               rel[rel.size() / 2], rel.back());
     // Exit code = functional result only. Timing is judged separately, on purpose:
     // the point of the demo is a run that passes this and still misses deadlines.
     return correct == count ? 0 : 1;
@@ -344,8 +355,20 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
 //   With --cpu everything shares one core, so one hog thread is enough.
 // - Duty-cycled (busy, then sleep). A hog that never sleeps would starve the
 //   prio-10 worker forever, and requests would hang instead of being late.
+// - Aligned: all threads follow ONE absolute schedule. Each cycle starts at
+//   start + k*(busy+idle); the thread spins until busy_ms into the cycle, then
+//   sleeps until the next cycle starts. So all cores are busy at the same time
+//   and free at the same time. The first version slept idle_ms after each busy
+//   spell. Its threads drifted apart, a core was almost always free, and the
+//   multi-core defect run had only 18/200 late (traced capture, 2026-11-13).
+//   --unaligned keeps that old behaviour.
+// Spinning reads ClockCycles() (no kernel call, so the spin adds no trace
+// events). Sleeping uses CLOCK_MONOTONIC, the clock the timers use.
 
-struct HogArgs { int index; uint32_t busy_ms, idle_ms; uint64_t end; };
+struct HogArgs {
+    int index; uint32_t busy_ms, idle_ms; bool aligned;
+    uint64_t start_cyc, start_ns, end_cyc;   // shared schedule, set once by run_hog
+};
 
 static void* hog_main(void* p) {
     const HogArgs* a = static_cast<const HogArgs*>(p);
@@ -353,27 +376,47 @@ static void* hog_main(void* p) {
     char name[16];
     snprintf(name, sizeof name, "rl_hog%d", a->index);
     pthread_setname_np(pthread_self(), name);
-    while (ClockCycles() < a->end) {
-        spin_us(a->busy_ms * 1000);
-        if (a->idle_ms) delay(a->idle_ms);
+    if (!a->aligned) {
+        while (ClockCycles() < a->end_cyc) {
+            spin_us(a->busy_ms * 1000);
+            if (a->idle_ms) delay(a->idle_ms);
+        }
+        return nullptr;
+    }
+    const uint64_t cps       = SYSPAGE_ENTRY(qtime)->cycles_per_sec;
+    const uint64_t period_ms = a->busy_ms + a->idle_ms;
+    for (uint64_t k = 0;; ++k) {
+        const uint64_t cycle_cyc = a->start_cyc + k * period_ms * cps / 1000;
+        if (cycle_cyc >= a->end_cyc) break;
+        const uint64_t busy_end = cycle_cyc + (uint64_t)a->busy_ms * cps / 1000;
+        while (ClockCycles() < busy_end) { }
+        // A wakeup that comes late (timer tick granularity) only shortens the next
+        // busy spell; it can't shift the schedule, because the spell ends at an
+        // absolute time.
+        sleep_until_ns(a->start_ns + (k + 1) * period_ms * 1000000ULL);
     }
     return nullptr;
 }
 
 static int run_hog(int threads, int prio, uint32_t busy_ms, uint32_t idle_ms, uint32_t seconds,
-                   bool fifo) {
+                   bool fifo, bool aligned) {
     pin_self();
     const uint64_t cps = SYSPAGE_ENTRY(qtime)->cycles_per_sec;
-    const uint64_t end = ClockCycles() + cps * seconds;   // bounded: the hog always stops
-    printf("hog: pid %d, %d thread(s) at priority %d %s, busy %u ms / idle %u ms, for %u s%s\n",
-           getpid(), threads, prio, fifo ? "FIFO" : "RR", busy_ms, idle_ms, seconds,
-           g_cpu >= 0 ? " (pinned)" : "");
+    // One shared start, a little in the future so every thread exists before the
+    // first cycle. The same instant is read on both clocks.
+    const uint64_t lead_ms   = 20;
+    const uint64_t start_cyc = ClockCycles() + lead_ms * cps / 1000;
+    const uint64_t start_ns  = mono_ns() + lead_ms * 1000000ULL;
+    const uint64_t end_cyc   = start_cyc + cps * seconds;   // bounded: the hog always stops
+    printf("hog: pid %d, %d thread(s) at priority %d %s, busy %u ms / idle %u ms, %s, for %u s%s\n",
+           getpid(), threads, prio, fifo ? "FIFO" : "RR", busy_ms, idle_ms,
+           aligned ? "aligned" : "unaligned", seconds, g_cpu >= 0 ? " (pinned)" : "");
     fflush(stdout);
 
     std::vector<pthread_t> tids(threads);
     std::vector<HogArgs>   args(threads);
     for (int i = 0; i < threads; ++i) {
-        args[i] = HogArgs{i, busy_ms, idle_ms, end};
+        args[i] = HogArgs{i, busy_ms, idle_ms, aligned, start_cyc, start_ns, end_cyc};
         pthread_attr_t a;
         pthread_attr_init(&a);
         pthread_attr_setinheritsched(&a, PTHREAD_EXPLICIT_SCHED);
@@ -396,17 +439,19 @@ static void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s server handoff|inherit|direct [--cpu N]\n"
             "       %s client [index 0-255] [count] [work_us] [period_ms] [deadline_us] [--cpu N]\n"
-            "       %s hog [threads, 0 = auto] [prio] [busy_ms] [idle_ms] [seconds] [--fifo] [--cpu N]\n",
+            "       %s hog [threads, 0 = auto] [prio] [busy_ms] [idle_ms] [seconds] [--fifo] "
+            "[--unaligned] [--cpu N]\n",
             argv0, argv0, argv0);
 }
 
 int main(int argc, char** argv) {
     // Pull out the options. What is left is positional: av[0] role av[1...] values.
     std::vector<const char*> av;
-    bool fifo = false;
+    bool fifo = false, aligned = true;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--cpu") == 0 && i + 1 < argc) g_cpu = atoi(argv[++i]);
         else if (strcmp(argv[i], "--fifo") == 0)           fifo = true;
+        else if (strcmp(argv[i], "--unaligned") == 0)      aligned = false;
         else                                               av.push_back(argv[i]);
     }
     const int ncpu = _syspage_ptr->num_cpu;
@@ -430,7 +475,7 @@ int main(int argc, char** argv) {
         if (threads == 0) threads = g_cpu >= 0 ? 1 : ncpu;   // auto: one per core, or one if pinned
         int prio = (int)arg(2, 20);
         if (threads < 1 || prio < 1 || prio > 255) { usage(argv[0]); return 2; }
-        return run_hog(threads, prio, arg(3, 8), arg(4, 2), arg(5, 5), fifo);
+        return run_hog(threads, prio, arg(3, 8), arg(4, 2), arg(5, 5), fifo, aligned);
     }
     usage(argv[0]);
     return 2;
