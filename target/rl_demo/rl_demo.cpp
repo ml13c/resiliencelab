@@ -269,8 +269,12 @@ static uint64_t mono_ns() {
 // Timers normally expire on the 1 ms clock tick. The aligned capture
 // (2026-11-13) showed timer interrupts at exact multiples of 1000 us, and each
 // run's "release delay" was a constant 38-815 us: tick quantization, not
-// waiting. TIMER_PRECISE asks for a high-resolution timer instead. If this
-// system rejects the flag, fall back to tick timing (once, with a message).
+// waiting. TIMER_PRECISE asks for a high-resolution timer instead. Capture 3
+// (2026-11-14) showed that it is ACCEPTED here but changes nothing measurable:
+// wakeups still trail the scheduled time by a constant few hundred us. The
+// analyzer doesn't depend on it, because it takes each release from the kernel
+// (the moment the timer actually woke the client). If the flag is rejected, fall
+// back to plain absolute sleeps (once, with a message).
 static std::atomic<bool> g_precise{true};
 
 static void sleep_until_ns(uint64_t t) {
@@ -354,7 +358,8 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
         printf("req %u:%-4u %9.1f us%s%s%s%s\n", index, r.seq, r.us, r.late ? "  LATE" : "",
                r.ok ? "" : "  WRONG", r.err ? "  " : "", r.err ? strerror(r.err) : "");
     std::sort(lat.begin(), lat.end());
-    printf("timers: %s\n", g_precise ? "precise (TIMER_PRECISE)" : "tick (1 ms)");
+    printf("timers: %s\n", g_precise ? "TIMER_PRECISE accepted (no effect measured on this image)"
+                                     : "TIMER_PRECISE rejected, tick timing");
     printf("releases skipped (previous request overran its period): %u\n", skipped);
     printf("functional: %u/%u correct\n", correct, count);
     printf("deadline %u us: %u/%u late (client-measured)\n", deadline_us, late, count);
@@ -363,7 +368,8 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
                lat.front(), lat[lat.size() / 2], lat.back());
     std::sort(rel.begin(), rel.end());
     if (!rel.empty())
-        printf("release delay us (scheduled release -> send): median %.1f  max %.1f\n",
+        printf("release delay us (scheduled release -> send, incl. timer tick rounding): "
+               "median %.1f  max %.1f\n",
                rel[rel.size() / 2], rel.back());
     // Exit code = functional result only. Timing is judged separately, on purpose:
     // the point of the demo is a run that passes this and still misses deadlines.

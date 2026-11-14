@@ -39,6 +39,9 @@ class KillCheckRegression(unittest.TestCase):
         self.assertEqual(self.res.warnings, [])
         self.assertEqual(self.res.notes, [])
         self.assertEqual({r.status for r in self.res.rows}, {"ok"})
+        # ipc_probe reports no deadline and no reply check: d1 = 0 on 100 and 103.
+        self.assertEqual({(r.deadline_us, r.late) for r in self.res.rows}, {(None, None)})
+        self.assertEqual(self.res.rows[0].label, "0:1")
 
     def test_request1_regression_values(self):
         r = self.res.rows[0]
@@ -111,18 +114,24 @@ def shift(text, base, host32=False):
 CLIENT, SERVER = (100, 1), (200, 1)
 
 
-def scenario(skip=(), d1=30, swap_101_102=False, mid=""):
+def scenario(skip=(), d1=30, swap_101_102=False, mid="", deadline=0, reply_flag=0, d1_102=0,
+             sleep=False):
     """Client on CPU 0, server on CPU 1, one request with id 1.
 
     skip: marker codes to leave out. swap_101_102: emit 102 at t=30 and 101 at
     t=530, i.e. the server's markers in the wrong order (file stays time-ordered).
     mid: extra line(s) placed between t=30 and t=530, during the server's work.
+    deadline / reply_flag / d1_102: d1 of markers 100 / 103 / 102 (0 = not reported).
+    sleep: the client sleeps first, and its timer fires at t=6 (THNANOSLEEP ->
+    THREADY on CPU 1), so the request's release is t=6. Marker 100 is at t=20.
     """
     first, second = (102, 101) if swap_101_102 else (101, 102)
-    lines = [
+    d1_of = {101: d1, 102: d1_102}
+    pre = [th(3, 0, "THNANOSLEEP", *CLIENT, 30), th(6, 1, "THREADY", *CLIENT, 30)] if sleep else []
+    lines = pre + [
         th(10, 0, "THRUNNING", *CLIENT, 30),
         th(11, 1, "THRUNNING", 1, 2, 0),                 # idle on CPU 1
-        mark(20, 0, 100, 1),
+        mark(20, 0, 100, 1, deadline),
         ev(21, 0, "KER_CALL", "MSG_SENDV/11"),
         "                      coid:0x40000001\n",         # continuation line
         "                 info->pid:999\n",                # continuation line
@@ -133,14 +142,14 @@ def scenario(skip=(), d1=30, swap_101_102=False, mid=""):
         th(25, 0, "THREPLY", *CLIENT, 30),               # client blocks on CPU 0
         th(26, 0, "THRUNNING", 1, 1, 0),                 # idle on CPU 0
         th(29, 1, "THREADY", 300, 1, 10),                # another thread's THREADY on CPU 1
-        mark(30, 1, first, 1, d1 if first == 101 else 0),
+        mark(30, 1, first, 1, d1_of[first]),
         mid,
-        mark(530, 1, second, 1, d1 if second == 101 else 0),
+        mark(530, 1, second, 1, d1_of[second]),
         th(531, 1, "THREADY", *CLIENT, 30),              # server replies: wakes client
         th(532, 0, "THREADY", 1, 1, 0),
         th(533, 0, "THRUNNING", *CLIENT, 30),
         th(534, 1, "THRECEIVE", *SERVER, 30),
-        mark(540, 0, 103, 1),
+        mark(540, 0, 103, 1, reply_flag),
     ]
     lines = [ln for ln in lines if not any(f":EVENT:{c} " in ln for c in skip)]
     return START + time_ev(0, 1) + "".join(lines)
@@ -228,10 +237,10 @@ class SyntheticCutOff(unittest.TestCase):
         self.assertIsNone(res.rows[0].total)
         code, out, err = run_main(text)
         self.assertEqual(code, 0)
-        # reply_us, total_us and the 103 cpu print as '-'
-        self.assertEqual(out.splitlines()[-1].split()[-5:], ["-", "-", "0,1,1,-", "cut", "off"])
+        # reply_us, send_us, resp_us, ddl_us and late print as '-'
+        self.assertEqual(out.splitlines()[-1].split()[-7:], ["-", "-", "-", "-", "-", "cut", "off"])
         # Last event is THRECEIVE at t=534, last marker 102 at t=530: 4 ticks = 4 us.
-        self.assertIn("note: req 1: cut off at trace end (missing 103); "
+        self.assertIn("note: req 0:1: cut off at trace end (missing 103); "
                       "the capture ended 4.0 us after marker 102", err)
 
     def test_cut_off_right_after_start(self):
@@ -245,8 +254,8 @@ class SyntheticCutOff(unittest.TestCase):
         res = run(text)
         r1, r2 = res.rows
         self.assertEqual((r1.status, r2.status), ("incomplete", "cut off"))
-        self.assertTrue(warned(res, "req 1: missing marker(s) 101, 102, 103 (client 100/1@30 "
-                                    f"started request 2 later (line {line_of(text, req2)}))"),
+        self.assertTrue(warned(res, "req 0:1: missing marker(s) 101, 102, 103 (client 100/1@30 "
+                                    f"started request 0:2 later (line {line_of(text, req2)}))"),
                         res.warnings)
         self.assertEqual(run_main(text)[0], 1)
 
@@ -288,6 +297,115 @@ class SyntheticEmpty(unittest.TestCase):
         self.assertTrue(warned(res, "no ipc_probe markers (user events 100-103) found"),
                         res.warnings)
         self.assertEqual(run_main(text)[0], 1)
+
+
+CLIENT_B, WORKER = (101, 1), (200, 2)
+ID_B1 = (1 << 24) | 1          # client index 1, sequence 1
+
+
+def two_clients(id_b):
+    """Clients A (CPU 0) and B (CPU 1) each send one request to server 200/1 on
+    CPU 2, both in flight at once. A uses id 1, B uses id_b."""
+    return (START + th(10, 0, "THRUNNING", *CLIENT, 30) + th(11, 1, "THRUNNING", *CLIENT_B, 30)
+            + th(12, 2, "THRUNNING", *SERVER, 30)
+            + mark(20, 0, 100, 1) + mark(21, 1, 100, id_b)
+            + mark(30, 2, 101, 1, 30) + mark(530, 2, 102, 1) + mark(540, 0, 103, 1)
+            + mark(541, 2, 101, id_b, 30) + mark(1041, 2, 102, id_b) + mark(1050, 1, 103, id_b))
+
+
+class SyntheticKeys(unittest.TestCase):
+    """Requests keyed by (client thread, request id); server markers matched by in-flight id."""
+
+    def test_two_clients_with_distinct_ids(self):
+        res = run(two_clients(ID_B1))
+        self.assertEqual(res.warnings, [])
+        a, b = res.rows
+        self.assertEqual((a.label, a.client, b.label, b.client), ("0:1", CLIENT, "1:1", CLIENT_B))
+        self.assertEqual((a.recv, a.work, b.recv, b.work), (10, 500, 520, 500))
+
+    def test_same_id_in_flight_from_two_clients_is_a_collision(self):
+        res = run(two_clients(1))          # the "two clients both number from 1" case
+        self.assertEqual(sum("request id collision" in w for w in res.warnings), 2, res.warnings)
+        self.assertEqual({r.client for r in res.rows}, {CLIENT, CLIENT_B})
+        self.assertTrue(all(r.status == "check" for r in res.rows))
+
+    def test_handoff_inside_the_server_is_not_a_warning(self):
+        text = (START + th(10, 0, "THRUNNING", *CLIENT, 30) + th(12, 2, "THRUNNING", *SERVER, 30)
+                + mark(20, 0, 100, 1) + mark(30, 2, 101, 1, 30)
+                + th(40, 3, "THRUNNING", *WORKER, 10) + mark(540, 3, 102, 1, 10)
+                + mark(550, 0, 103, 1))
+        res = run(text)
+        self.assertEqual(res.warnings, [])
+        self.assertEqual(res.rows[0].thread(rl.SRV_REPLY), rl.Thread(*WORKER, 10))
+        out = io.StringIO()
+        rl.print_table(res, out)
+        self.assertIn(" /2@10 ", out.getvalue())   # replier column: worker of the same process
+
+    def test_server_markers_from_two_processes_warn(self):
+        text = (START + th(10, 0, "THRUNNING", *CLIENT, 30) + th(12, 2, "THRUNNING", *SERVER, 30)
+                + mark(20, 0, 100, 1) + mark(30, 2, 101, 1, 30)
+                + th(40, 3, "THRUNNING", 300, 1, 30) + mark(540, 3, 102, 1)
+                + mark(550, 0, 103, 1))
+        self.assertTrue(warned(run(text), "server process differs"))
+
+
+class SyntheticDeadline(unittest.TestCase):
+    """Verdict on resp (release -> reply); send (100 -> 103) shown alongside."""
+
+    def test_release_comes_from_the_kernel_wake(self):
+        r = run(scenario(sleep=True)).rows[0]
+        # Timer fired at t=6, marker 100 at 20, 103 at 540 (1 tick = 1 us here).
+        self.assertEqual((r.release, r.wait, r.total, r.resp), (6, 14, 520, 534))
+
+    def test_late_from_release_even_when_on_time_from_send(self):
+        res = run(scenario(sleep=True, deadline=525))   # send 520 <= 525 < resp 534
+        r = res.rows[0]
+        self.assertEqual((r.late, r.judged_from), (True, "release"))
+        self.assertEqual(res.warnings, [])              # lateness is a verdict, not a warning
+        out = io.StringIO()
+        rl.print_table(res, out)
+        self.assertIn("deadline: 1/1 late, judged on resp", out.getvalue())
+
+    def test_no_release_in_trace_falls_back_to_send(self):
+        res = run(scenario(deadline=515))               # no sleep before the request
+        r = res.rows[0]
+        self.assertEqual((r.release, r.late, r.judged_from), (None, True, "send"))
+        out = io.StringIO()
+        rl.print_table(res, out)
+        self.assertIn(" LATE* ", out.getvalue())
+        self.assertIn("1 marked * judged on send", out.getvalue())
+
+    def test_a_wake_only_counts_for_the_next_request(self):
+        text = (START + th(3, 0, "THNANOSLEEP", *CLIENT, 30) + th(6, 0, "THREADY", *CLIENT, 30)
+                + th(10, 0, "THRUNNING", *CLIENT, 30)
+                + mark(20, 0, 100, 1, 100) + mark(30, 0, 103, 1)
+                + mark(40, 0, 100, 2, 100) + mark(50, 0, 103, 2))   # no sleep before request 2
+        r1, r2 = run(text).rows
+        self.assertEqual((r1.release, r2.release), (6, None))
+
+    def test_no_deadline_no_verdict(self):
+        r = run(scenario(sleep=True)).rows[0]
+        self.assertEqual((r.deadline_us, r.late), (None, None))
+
+    def test_wrong_reply_is_a_functional_failure(self):
+        text = scenario(reply_flag=2)
+        res = run(text)
+        self.assertEqual(res.rows[0].status, "wrong reply")
+        self.assertTrue(warned(res, "wrong reply"))
+        code, out, _ = run_main(text)
+        self.assertEqual(code, 1)
+        self.assertIn("replies: 0 correct, 1 wrong", out)
+
+    def test_correct_reply_is_counted(self):
+        res = run(scenario(reply_flag=1))
+        self.assertEqual(res.warnings, [])
+        out = io.StringIO()
+        rl.print_table(res, out)
+        self.assertIn("replies: 1 correct, 0 wrong", out.getvalue())
+
+    def test_replying_thread_priority_cross_check(self):
+        res = run(scenario(d1_102=10))                  # kernel ran the replier at 30
+        self.assertTrue(warned(res, "replying thread self-reported priority 10"), res.warnings)
 
 
 # The counter's low 32 bits wrap at rel. tick 256 (0xFFFFFF00 + 0x100): after
