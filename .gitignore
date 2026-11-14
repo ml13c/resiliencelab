@@ -1,4 +1,5 @@
 /ipc_probe
+/rl_demo
 /hello
 *.o
 traces/**/*.txt
