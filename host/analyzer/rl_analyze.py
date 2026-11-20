@@ -24,7 +24,7 @@ Two latencies per request:
          ready but not yet sending (e.g. behind equal-priority load).
          Requests with no sleep before them (the first one) are judged on send.
 
-Usage:  python rl_analyze.py <traceprinter.txt>
+Usage:  python rl_analyze.py <traceprinter.txt> [--json PATH | --json -]
 Exit:   0 = clean, 1 = warnings (printed to stderr), 2 = fatal (bad input).
         A request the capture ended before it finished gets status "cut off" and
         a note on stderr; that alone is not a warning.
@@ -33,11 +33,15 @@ Stdlib only, Python 3.12.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, NamedTuple
+
+from rl_autopsy import Attribution, Timeline, attribute
 
 # Marker codes, mirroring the enum in target/ipc_probe/ipc_probe.cpp.
 REQ_START, SRV_GOT, SRV_REPLY, REQ_END = 100, 101, 102, 103
@@ -75,6 +79,7 @@ class Event(NamedTuple):
     name: str     # THRUNNING, EVENT:101, MSG_SENDV/11, ...
     rest: str
     lineno: int
+    more: tuple[str, ...] = ()   # its indented continuation lines, stripped ("pid:1", "name:...")
 
 
 class Thread(NamedTuple):
@@ -116,6 +121,7 @@ class Row:
     status: str = "ok"
     late: bool | None = None       # None: no deadline, or not finished
     judged_from: str | None = None  # "release", or "send" when no release was found
+    autopsy: Attribution | None = None   # where the time went (completed requests)
 
     @property
     def label(self) -> str:
@@ -176,6 +182,9 @@ class Result:
     rows: list[Row] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)   # make the exit code 1
     notes: list[str] = field(default_factory=list)      # information only
+    timeline: Timeline = field(default_factory=Timeline)
+    cpus: list[int] | None = None   # CPUs the request's threads may use (set by run_autopsy)
+    cpus_source: str = ""
 
 
 @dataclass
@@ -218,10 +227,23 @@ def parse_header(numbered: Iterator[tuple[int, str]]) -> dict[str, str]:
 
 
 def iter_events(numbered: Iterable[tuple[int, str]]) -> Iterator[Event]:
+    """Event lines, each with its continuation lines attached as .more.
+
+    An event is yielded when the next event line (or the end) shows that its
+    continuation lines are complete. The order and line numbers are unchanged.
+    """
+    pending: Event | None = None
+    more: list[str] = []
     for lineno, line in numbered:
         m = EVENT_RE.match(line)
         if m:
-            yield Event(int(m[1], 16), int(m[2]), m[3], m[4], m[5], lineno)
+            if pending is not None:
+                yield pending._replace(more=tuple(more))
+            pending, more = Event(int(m[1], 16), int(m[2]), m[3], m[4], m[5], lineno), []
+        elif pending is not None and line.strip():
+            more.append(line.strip())
+    if pending is not None:
+        yield pending._replace(more=tuple(more))
 
 
 class Clock:
@@ -305,10 +327,11 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
     warn = res.warnings.append
     ctx = _Ctx(res)
 
-    # running[cpu] = the thread the kernel last dispatched on that CPU (or None).
-    # A CPU runs one thread at a time, and TraceEvent() is a kernel call made
-    # by the running thread, so running[cpu] at a USREVENT names its emitter.
-    running: dict[int, Thread | None] = {}
+    # The Timeline tracks running[cpu]: the thread the kernel last dispatched on
+    # that CPU (or None). A CPU runs one thread at a time, and TraceEvent() is a
+    # kernel call made by the running thread, so running[cpu] at a USREVENT
+    # names its emitter. It also keeps the whole history for the autopsy.
+    tl = res.timeline
     last_t: dict[int, int] = {}
     markers: list[Marker] = []
     unknown_codes: Counter[int] = Counter()
@@ -340,22 +363,18 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
             if state.get(key) == "THNANOSLEEP" and ev.name in ("THREADY", "THRUNNING"):
                 woke[key] = ev.t
             state[key] = ev.name
-            if ev.name == "THRUNNING":
-                # The kernel dispatched th onto this CPU.
-                if th.prio is None:
-                    no_prio += 1
-                running[ev.cpu] = th
-            else:
-                # Any other state (THREADY, THREPLY, THRECEIVE, ...) logged on this CPU
-                # for the thread we think is running means it has left the CPU. Until
-                # the next THRUNNING we don't know who runs here.
-                # The same states for OTHER threads must not touch running[cpu]:
-                # "CPU:02 THREADY pid:X" means CPU 2 woke X, not that X runs on CPU 2.
-                cur = running.get(ev.cpu)
-                if cur is not None and (cur.pid, cur.tid) == (th.pid, th.tid):
-                    running[ev.cpu] = None
-                if ev.name in ("THDEAD", "THDESTROY"):   # used to tell "killed" from "cut off"
-                    ctx.died.setdefault((th.pid, th.tid), (ev.t, ev.lineno))
+            if ev.name == "THRUNNING" and th.prio is None:
+                no_prio += 1
+            # THRUNNING: the kernel dispatched th onto this CPU. Any other state
+            # logged on this CPU for the thread running there means it left the
+            # CPU. Other threads' states don't change running[cpu] (see Timeline).
+            tl.record_thread(ev.t, ev.cpu, ev.name, th.pid, th.tid, th.prio)
+            if ev.name in ("THDEAD", "THDESTROY"):   # used to tell "killed" from "cut off"
+                ctx.died.setdefault((th.pid, th.tid), (ev.t, ev.lineno))
+
+        elif ev.cls == "PROCESS" and ev.name in ("PROCCREATE_NAME", "PROCTHREAD_NAME"):
+            fields = dict(ln.split(":", 1) for ln in ev.more if ":" in ln)
+            tl.record_name(ev.name, {k.strip(): v.strip() for k, v in fields.items()})
 
         elif ev.cls == "USREVENT":
             lineno = ev.lineno
@@ -367,7 +386,8 @@ def analyze(lines: Iterable[str], source: str = "<input>") -> Result:
             if code not in MARKER_CODES:
                 unknown_codes[code] += 1   # other apps may emit their own codes
                 continue
-            emitter = running.get(ev.cpu)
+            now = tl.running(ev.cpu)
+            emitter = Thread(*now) if now is not None else None
             wake = None
             if emitter is not None:
                 key = (emitter.pid, emitter.tid)
@@ -569,6 +589,72 @@ def _check_request(g: _Group, ctx: _Ctx) -> Row:
     return row
 
 
+def resolve_cpus(spec: str | None, trace_path: str | None, header: dict[str, str]) -> tuple[list[int], str]:
+    """The CPUs the request's threads may run on, and where that came from.
+
+    Order: --cpus (e.g. "0,2" or "all"), else the scenario's metadata file
+    <trace stem>.meta next to the trace (key "cpus", written by run_demo.sh),
+    else every CPU in the trace header. Never inferred from the trace itself.
+    """
+    try:
+        ncpu = int(header.get("TRACE_CPU_NUM", ""))
+    except ValueError:
+        raise TraceError("header has no usable TRACE_CPU_NUM; pass --cpus") from None
+    source = "--cpus"
+    if spec is None and trace_path:
+        meta = os.path.splitext(trace_path)[0] + ".meta"
+        if os.path.exists(meta):
+            with open(meta, encoding="utf-8") as f:
+                kv = dict(ln.split("=", 1) for ln in f.read().splitlines() if "=" in ln)
+            spec, source = kv.get("cpus", "").strip() or None, f"from {os.path.basename(meta)}"
+            if spec is None:
+                raise TraceError(f"{meta} has no cpus= line")
+    if spec is None:
+        return list(range(ncpu)), "default: all cores"
+    if spec == "all":
+        return list(range(ncpu)), source
+    try:
+        cpus = sorted({int(x) for x in spec.split(",")})
+    except ValueError:
+        raise TraceError(f"bad CPU list {spec!r} ({source}); use e.g. 0,2 or all") from None
+    bad = [c for c in cpus if not 0 <= c < ncpu]
+    if bad or not cpus:
+        raise TraceError(f"CPU(s) {bad or spec} ({source}) not in this trace's 0..{ncpu - 1}")
+    return cpus, source
+
+
+def phases_of(r: Row) -> list[tuple[str, int, int, ThreadKey | None]] | None:
+    """The request's holders, phase by phase (see rl_autopsy). None if unfinished."""
+    if any(c not in r.m for c in MARKER_CODES):
+        return None
+
+    def key(code: int) -> ThreadKey | None:
+        th = r.thread(code)
+        return (th.pid, th.tid) if th else None
+
+    t = {c: r.m[c].t for c in MARKER_CODES}
+    start = r.release if r.release is not None else t[REQ_START]
+    return [("client", start, t[REQ_START], key(REQ_START)),
+            ("recv", t[REQ_START], t[SRV_GOT], key(SRV_GOT)),
+            ("work", t[SRV_GOT], t[SRV_REPLY], key(SRV_REPLY)),
+            ("reply", t[SRV_REPLY], t[REQ_END], key(REQ_START))]
+
+
+def run_autopsy(res: Result, cpus: list[int], source: str) -> None:
+    """Attribute every completed request's time (see rl_autopsy)."""
+    res.cpus, res.cpus_source = cpus, source
+    for r in res.rows:
+        ph = phases_of(r)
+        if ph is not None:
+            r.autopsy = attribute(ph, res.timeline, cpus)
+
+
+def fmt_cpus(cpus: list[int]) -> str:
+    if len(cpus) > 1 and cpus == list(range(cpus[0], cpus[-1] + 1)):
+        return f"{cpus[0]}-{cpus[-1]}"
+    return ",".join(map(str, cpus))
+
+
 def fmt_us(ticks: int | None, cps: int) -> str:
     """Ticks -> microseconds, 0.1 us resolution. Conversion happens only here."""
     return "-" if ticks is None else f"{ticks * 1e6 / cps:.1f}"
@@ -579,7 +665,9 @@ def print_table(res: Result, out=None) -> None:
     print(f"trace: {res.source}  cycles/sec: {res.cps}  "
           f"cpus: {res.header.get('TRACE_CPU_NUM', '?')}  events: {res.n_events}  "
           f"markers: {res.n_markers}  requests: {len(res.rows)}"
-          + (f"  32-bit wraps rebuilt: {res.n_wraps}" if res.n_wraps else ""), file=out)
+          + (f"  32-bit wraps rebuilt: {res.n_wraps}" if res.n_wraps else "")
+          + (f"  autopsy cpus: {fmt_cpus(res.cpus)} ({res.cpus_source})" if res.cpus else ""),
+          file=out)
     # wait = release -> send; send = 100 -> 103; resp = release -> 103 (the verdict's basis).
     cols = f"{'req':<8}{'client':<16}{'server':<16}{'replier':<10}" \
            f"{'wait_us':>9}{'recv_us':>9}{'work_us':>9}{'reply_us':>9}" \
@@ -612,35 +700,129 @@ def print_table(res: Result, out=None) -> None:
               f"{fmt_us(r.total, res.cps):>9}{fmt_us(r.resp, res.cps):>9}{ddl:>8}  "
               f"{late:<6}{r.status}", file=out)
 
+    s = summarize(res)
+    if s["judged"]:
+        print(f"deadline: {s['late']}/{s['judged']} late, judged on resp (release -> reply)"
+              + (f"; {s['judged_on_send']} marked * judged on send (no release in the trace)"
+                 if s["judged_on_send"] else ""), file=out)
+    if s["replies_correct"] or s["replies_wrong"]:
+        print(f"replies: {s['replies_correct']} correct, {s['replies_wrong']} wrong", file=out)
+
+
+def exit_code(res: Result) -> int:
+    return 1 if res.warnings else 0
+
+
+def summarize(res: Result) -> dict:
+    """Run-level counts, shared by the table and the JSON so they can't disagree."""
     judged = [r for r in res.rows if r.late is not None]
-    if judged:
-        n_late = sum(r.late for r in judged)
-        n_send = sum(r.judged_from == "send" for r in judged)
-        print(f"deadline: {n_late}/{len(judged)} late, judged on resp (release -> reply)"
-              + (f"; {n_send} marked * judged on send (no release in the trace)" if n_send else ""),
-              file=out)
     flags = [r.m[REQ_END].d1 for r in res.rows if REQ_END in r.m and r.m[REQ_END].d1]
-    if flags:
-        print(f"replies: {flags.count(1)} correct, {flags.count(2)} wrong", file=out)
+    return {
+        "requests": len(res.rows),
+        "judged": len(judged),                       # requests with a deadline and a reply
+        "late": sum(bool(r.late) for r in judged),
+        "judged_on_send": sum(r.judged_from == "send" for r in judged),
+        "replies_correct": flags.count(1),
+        "replies_wrong": flags.count(2),
+        "statuses": dict(Counter(r.status for r in res.rows)),
+        "warnings": len(res.warnings),
+        "exit_code": exit_code(res),
+    }
+
+
+JSON_SCHEMA = "resiliencelab.analyze/0"   # bump when a field changes meaning or is removed
+
+
+def to_json(res: Result) -> dict:
+    """Machine-readable result: for the HTML report, CI, and comparing runs.
+
+    Times appear twice: exact integer clock ticks (absolute timestamps and
+    intervals), and microseconds rounded to 0.1 for reading. Anything not
+    known is null.
+    """
+    def us(ticks: int | None) -> float | None:
+        return None if ticks is None else round(ticks * 1e6 / res.cps, 1)
+
+    def thread(th: Thread | None) -> dict | None:
+        return None if th is None else {"pid": th.pid, "tid": th.tid, "prio": th.prio}
+
+    def request(r: Row) -> dict:
+        srv, rep = r.thread(SRV_GOT), r.thread(SRV_REPLY)
+        intervals = {"wait": r.wait, "recv": r.recv, "work": r.work, "reply": r.reply,
+                     "send": r.total, "resp": r.resp}
+        end_flag = r.m[REQ_END].d1 if REQ_END in r.m else 0
+        return {
+            "id": r.rid,
+            "label": r.label,
+            "client": thread(r.thread(REQ_START) or r.thread(REQ_END)),
+            "server": thread(srv),
+            "replier": thread(rep),
+            # 101 and 102 from different threads of one process: the receive
+            # thread handed the request to another thread (rule 1's shape).
+            "handoff": bool(srv and rep and srv.pid == rep.pid and srv.tid != rep.tid),
+            "release_t": r.release,
+            "markers": {str(c): {"t": mk.t, "cpu": mk.cpu, "d1": mk.d1, "line": mk.lineno}
+                        for c, mk in sorted(r.m.items())},
+            "ticks": intervals,
+            "us": {k: us(v) for k, v in intervals.items()},
+            "deadline_us": r.deadline_us,
+            "late": r.late,
+            "judged_from": r.judged_from,
+            "reply_ok": {1: True, 2: False}.get(end_flag),
+            "status": r.status,
+        }
+
+    return {
+        "schema": JSON_SCHEMA,
+        "trace": res.source,
+        "cycles_per_sec": res.cps,
+        "cpus": int(res.header["TRACE_CPU_NUM"]) if res.header.get("TRACE_CPU_NUM", "").isdigit() else None,
+        "events": res.n_events,
+        "markers": res.n_markers,
+        "wraps_rebuilt": res.n_wraps,
+        "summary": summarize(res),
+        "requests": [request(r) for r in res.rows],
+        "warnings": res.warnings,
+        "notes": res.notes,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ResilienceLab analyzer v0: per-request table "
                                              "from traceprinter output.")
     ap.add_argument("trace", help="traceprinter text output (from a tracelogger -w capture)")
+    ap.add_argument("--json", metavar="PATH",
+                    help="also write the result as JSON to PATH; '-' prints JSON to stdout "
+                         "instead of the table")
+    ap.add_argument("--cpus", metavar="LIST",
+                    help="CPUs the request's threads may run on, e.g. 0 or 0,2 or all "
+                         "(default: <trace>.meta next to the trace, else all cores)")
     args = ap.parse_args(argv)
     try:
         with open(args.trace, encoding="utf-8", errors="replace") as f:
             res = analyze(f, args.trace)
+        run_autopsy(res, *resolve_cpus(args.cpus, args.trace, res.header))
     except (OSError, TraceError) as e:
         print(f"rl_analyze: error: {e}", file=sys.stderr)
         return 2
-    print_table(res)
+    if args.json == "-":
+        json.dump(to_json(res), sys.stdout, indent=1)
+        print()
+    else:
+        print_table(res)
+        if args.json:
+            try:
+                with open(args.json, "w", encoding="utf-8") as f:
+                    json.dump(to_json(res), f, indent=1)
+                    f.write("\n")
+            except OSError as e:
+                print(f"rl_analyze: error: cannot write {args.json}: {e}", file=sys.stderr)
+                return 2
     for n in res.notes:
         print(f"note: {n}", file=sys.stderr)
     for w in res.warnings:
         print(f"warning: {w}", file=sys.stderr)
-    return 1 if res.warnings else 0
+    return exit_code(res)
 
 
 if __name__ == "__main__":

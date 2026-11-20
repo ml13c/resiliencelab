@@ -7,6 +7,7 @@ Two kinds of test:
   only to exercise parser logic. They are NOT measurements.
 """
 import io
+import json
 import os
 import re
 import sys
@@ -50,6 +51,11 @@ class KillCheckRegression(unittest.TestCase):
         # The values recorded in CLAUDE.md, at 0.1 us resolution.
         got = [rl.fmt_us(x, self.res.cps) for x in (r.recv, r.work, r.reply, r.total)]
         self.assertEqual(got, ["11.9", "501.1", "4.4", "517.4"])
+
+    def test_request1_regression_values_in_json(self):
+        r = rl.to_json(self.res)["requests"][0]
+        self.assertEqual([r["us"][k] for k in ("recv", "work", "reply", "send")],
+                         [11.9, 501.1, 4.4, 517.4])
 
     def test_request1_priority_inheritance(self):
         r = self.res.rows[0]
@@ -206,14 +212,20 @@ class SyntheticParser(unittest.TestCase):
             run(" -- KERNEL EVENTS -- \n" + mark(5, 0, 100, 1))
 
 
-def run_main(text):
-    """Run the CLI on `text`; returns (exit code, stdout, stderr)."""
+def run_main(text, *extra):
+    """Run the CLI on `text` with extra arguments; returns (exit code, stdout, stderr).
+
+    In `extra`, the string "{dir}" is replaced by the temporary directory.
+    """
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "t.txt")
         with open(p, "w", encoding="utf-8") as f:
             f.write(text)
+        args = [p] + [a.replace("{dir}", d) for a in extra]
         with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
-            code = rl.main([p])
+            code = rl.main(args)
+        files = {n: Path(d, n).read_text(encoding="utf-8") for n in os.listdir(d) if n != "t.txt"}
+    run_main.files = files          # outputs the CLI wrote, read before the dir is removed
     return code, out.getvalue(), err.getvalue()
 
 
@@ -340,6 +352,7 @@ class SyntheticKeys(unittest.TestCase):
         out = io.StringIO()
         rl.print_table(res, out)
         self.assertIn(" /2@10 ", out.getvalue())   # replier column: worker of the same process
+        self.assertTrue(rl.to_json(res)["requests"][0]["handoff"])
 
     def test_server_markers_from_two_processes_warn(self):
         text = (START + th(10, 0, "THRUNNING", *CLIENT, 30) + th(12, 2, "THRUNNING", *SERVER, 30)
@@ -411,6 +424,42 @@ class SyntheticDeadline(unittest.TestCase):
 # The counter's low 32 bits wrap at rel. tick 256 (0xFFFFFF00 + 0x100): after
 # marker 101 (t=30) and before 102 (t=530), i.e. in the middle of the server's work.
 WRAP_BASE = (0x38 << 32) | 0xFFFFFF00
+
+
+class SyntheticJson(unittest.TestCase):
+    def test_json_carries_the_same_numbers_as_the_table(self):
+        res = run(scenario(sleep=True, deadline=525, reply_flag=1))
+        j = json.loads(json.dumps(rl.to_json(res)))     # must survive a real round trip
+        self.assertEqual(j["schema"], rl.JSON_SCHEMA)
+        r = j["requests"][0]
+        self.assertEqual((r["label"], r["client"], r["server"]),
+                         ("0:1", {"pid": 100, "tid": 1, "prio": 30}, {"pid": 200, "tid": 1, "prio": 30}))
+        self.assertEqual(r["ticks"], {"wait": 14, "recv": 10, "work": 500, "reply": 10,
+                                      "send": 520, "resp": 534})
+        self.assertEqual(r["us"]["resp"], 534.0)        # 1 tick = 1 us in the synthetic header
+        self.assertEqual((r["release_t"], r["markers"]["100"]["t"]), (6, 20))
+        self.assertEqual((r["deadline_us"], r["late"], r["judged_from"], r["reply_ok"]),
+                         (525, True, "release", True))
+        self.assertEqual((r["handoff"], r["status"]), (False, "ok"))
+        s = j["summary"]
+        self.assertEqual((s["requests"], s["judged"], s["late"], s["replies_correct"], s["exit_code"]),
+                         (1, 1, 1, 1, 0))
+
+    def test_unknowns_are_null(self):
+        r = rl.to_json(run(scenario(skip=(103,))))["requests"][0]
+        self.assertEqual((r["ticks"]["send"], r["us"]["send"], r["release_t"], r["late"], r["reply_ok"]),
+                         (None, None, None, None, None))
+
+    def test_cli_json_to_stdout_replaces_the_table(self):
+        code, out, _ = run_main(scenario(reply_flag=2), "--json", "-")
+        j = json.loads(out)                             # stdout is pure JSON
+        self.assertEqual((code, j["summary"]["exit_code"], j["requests"][0]["reply_ok"]), (1, 1, False))
+
+    def test_cli_json_to_file_keeps_the_table(self):
+        code, out, _ = run_main(scenario(), "--json", "{dir}/r.json")
+        self.assertEqual(code, 0)
+        self.assertIn("req     client", out)
+        self.assertEqual(json.loads(run_main.files["r.json"])["requests"][0]["label"], "0:1")
 
 
 class SyntheticWrap(unittest.TestCase):
