@@ -322,13 +322,21 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
     // inside the loop wrote to the log file on the SD card, and once a write
     // REPLY-blocked the client in devb-sdmmc for 163 ms (28 releases skipped in
     // the aligned 'fixed' capture). No file I/O while measuring.
-    struct Rec { uint32_t seq; double us; bool late, ok; int err; };
+    // Two latencies per request, as in the analyzer:
+    //   send = marker 100 -> 103 (MsgSend to reply), measured in clock cycles;
+    //   resp = scheduled release -> reply, what a periodic deadline counts from.
+    // resp includes the timer's wake-up offset (see sleep_until_ns) and any time
+    // the client was ready but not yet running. With tracing off it is the only
+    // release-based number there is. The analyzer's resp starts at the kernel's
+    // wake-up (THREADY) instead, so the two differ by the wake-up offset.
+    struct Rec { uint32_t seq; double send_us, resp_us; bool late_send, late_resp, ok; int err; };
     std::vector<Rec> recs;
     recs.reserve(count);
-    std::vector<double> lat, rel;
+    std::vector<double> lat, resp, rel;
     lat.reserve(count);
+    resp.reserve(count);
     rel.reserve(count);
-    uint32_t correct = 0, late = 0;
+    uint32_t correct = 0, late = 0, late_resp = 0;
     for (uint32_t seq = 1; seq <= count; ++seq) {
         const uint32_t id    = (index << 24) | seq;
         const uint32_t input = id * 2654435761u;         // varies per request
@@ -346,16 +354,21 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
         // SEND-blocked until the server receives, then REPLY-blocked until it replies.
         int rc = MsgSend(coid, &req, sizeof req, &rep, sizeof rep);
         uint64_t t1 = ClockCycles();
+        const uint64_t done_ns = mono_ns();   // `release` still holds this request's release
         int err = (rc == -1) ? errno : 0;
         bool ok = rc != -1 && rep.id == id && rep.result == fnv1a(id, input);
         mark(EV_REQ_END, id, ok ? 1 : 2);
 
         double us = (double)(t1 - t0) * 1e6 / cps;
+        double r_us = (double)(done_ns - release) / 1000.0;
         bool is_late = deadline_us != 0 && us > deadline_us;
+        bool is_late_resp = deadline_us != 0 && r_us > deadline_us;
         lat.push_back(us);
+        resp.push_back(r_us);
         correct += ok;
         late += is_late;
-        recs.push_back(Rec{seq, us, is_late, ok, err});
+        late_resp += is_late_resp;
+        recs.push_back(Rec{seq, us, r_us, is_late, is_late_resp, ok, err});
         release += period_ns;
         const uint64_t now = mono_ns();
         while (release <= now) { release += period_ns; ++skipped; }   // overran: skip
@@ -363,18 +376,27 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
     }
     name_close(coid);
 
+    // One line per request. Each LATE flag names its basis, so a reader (or
+    // rl_repeat.py) never has to guess which latency a verdict came from.
     for (const Rec& r : recs)
-        printf("req %u:%-4u %9.1f us%s%s%s%s\n", index, r.seq, r.us, r.late ? "  LATE" : "",
-               r.ok ? "" : "  WRONG", r.err ? "  " : "", r.err ? strerror(r.err) : "");
+        printf("req %u:%-4u  send %9.1f us  resp %9.1f us%s%s%s%s%s\n", index, r.seq,
+               r.send_us, r.resp_us, r.late_send ? "  LATE(send)" : "",
+               r.late_resp ? "  LATE(resp)" : "", r.ok ? "" : "  WRONG",
+               r.err ? "  " : "", r.err ? strerror(r.err) : "");
     std::sort(lat.begin(), lat.end());
     printf("timers: %s\n", g_precise ? "TIMER_PRECISE accepted (no effect measured on this image)"
                                      : "TIMER_PRECISE rejected, tick timing");
     printf("releases skipped (previous request overran its period): %u\n", skipped);
     printf("functional: %u/%u correct\n", correct, count);
-    printf("deadline %u us: %u/%u late (client-measured)\n", deadline_us, late, count);
+    printf("deadline %u us: %u/%u late from send, %u/%u late from release (client-measured)\n",
+           deadline_us, late, count, late_resp, count);
     if (!lat.empty())
         printf("latency us: min %.1f  median %.1f  max %.1f\n",
                lat.front(), lat[lat.size() / 2], lat.back());
+    std::sort(resp.begin(), resp.end());
+    if (!resp.empty())
+        printf("response us (release -> reply): min %.1f  median %.1f  max %.1f\n",
+               resp.front(), resp[resp.size() / 2], resp.back());
     std::sort(rel.begin(), rel.end());
     if (!rel.empty())
         printf("release delay us (scheduled release -> send, incl. timer tick rounding): "
@@ -388,9 +410,11 @@ static int run_client(uint32_t index, uint32_t count, uint32_t work_us, uint32_t
 // ---- hog --------------------------------------------------------------------
 //
 // CPU load at a chosen priority. Two design points:
-// - One thread per CPU by default. QNX schedules by strict priority across ALL
-//   cores, so to keep a prio-10 thread off the CPU, every core must be busy with
-//   something above it. One hog thread on a 4-core Pi leaves 3 cores free.
+// - One thread per CPU by default. To keep a prio-10 thread off the CPU, every
+//   core must be busy with something above it: one hog thread on a 4-core Pi
+//   leaves 3 cores free. (This used to say QNX schedules by strict priority across
+//   ALL cores. That is only a hypothesis, and QNX 8's docs contradict it: a thread
+//   made ready on CPU A displaces only lower-priority work on CPU A. See CLAUDE.md.)
 //   With --cpu everything shares one core, so one hog thread is enough.
 // - Duty-cycled (busy, then sleep). A hog that never sleeps would starve the
 //   prio-10 worker forever, and requests would hang instead of being late.
