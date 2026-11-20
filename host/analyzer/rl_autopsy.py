@@ -39,6 +39,14 @@ A "lower" share in the split view means the holder waited while a lower-
 priority thread ran on another allowed CPU. That isn't a scheduler fault; see
 above. The cause for it is named "not migrated".
 
+In the own view, a "lower" share is relabelled "wake-up switch" when the thread
+running there is the one that was already running on that CPU when the THREADY
+was logged, and it hasn't left since (a priority change in between doesn't
+count as leaving): usually the waker finishing its kernel call before the
+switch (e.g. the replier after MsgReply readied the client, measured ~0.5 us),
+or a thread a timer interrupt interrupted. That is wake-up latency on the
+holder's own CPU, not missing migration.
+
 Every instant lands in exactly one bucket, or is split into n equal shares, so
 each view's buckets add up exactly to the interval. Shares are
 fractions.Fraction of clock ticks, so the sum is exact, not approximately right.
@@ -60,6 +68,8 @@ State = tuple[str, "int | None", int]    # (state, prio, cpu the event was logge
 RUNNING, READY = "THRUNNING", "THREADY"
 IDLE_PID, IDLE_PRIO = 1, 0               # procnto's idle_cpu_N threads
 PRIORITY_LABELS = ("higher", "equal", "lower")
+WAKEUP = "wake-up switch"                # own view only: a bucket, culprit label and cause
+CULPRIT_LABELS = PRIORITY_LABELS + (WAKEUP,)   # shares charged to a named thread
 
 
 class Timeline:
@@ -133,15 +143,29 @@ class Timeline:
         i = bisect.bisect_right(times, t) - 1
         return self._st_v[key][i] if i >= 0 else None
 
-    def ready_cpu(self, key: Key, t: int) -> int | None:
-        """CPU of the THREADY event that started the READY state the thread is in at t."""
+    def ready_start(self, key: Key, t: int) -> tuple[int, int] | None:
+        """(time, CPU) of the THREADY event that started the READY state the thread is in at t."""
         times, vals = self._st_t.get(key, []), self._st_v.get(key, [])
         i = bisect.bisect_right(times, t) - 1
         while i >= 0 and vals[i][0] == READY:
             if i == 0 or vals[i - 1][0] != READY:
-                return vals[i][2]
+                return times[i], vals[i][2]
             i -= 1
         return None
+
+    def stayed(self, cpu: int, t0: int, t1: int) -> bool:
+        """True if one thread was on cpu from t0 through t1 without leaving it.
+
+        Compares threads, not events: a running thread that changes its own
+        priority (e.g. SchedSet back to 10 right after MsgReply, in rl_demo's
+        inherit mode) is logged as a new THRUNNING on the same CPU without a
+        context switch, and must still count as the same stay.
+        """
+        times, vals = self._run_t.get(cpu, []), self._run_v.get(cpu, [])
+        i0, i1 = bisect.bisect_right(times, t0) - 1, bisect.bisect_right(times, t1) - 1
+        if i0 < 0 or vals[i0] is None:
+            return False
+        return all(v is not None and v[:2] == vals[i0][:2] for v in vals[i0 + 1:i1 + 1])
 
     def changes(self, key: Key, t0: int, t1: int) -> list[int]:
         """Instants strictly inside (t0, t1) where the holder or ANY CPU changes.
@@ -169,11 +193,24 @@ class View:
 
 
 @dataclass
+class Cause:
+    """Why a request lost time, from one view. See classify()."""
+    name: str                      # one of CAUSES, SERVICE or MIXED
+    share: Fraction                # of the lost time; for SERVICE, running time / interval
+    lost: Fraction                 # interval - running, in ticks
+    by_cause: dict                 # cause -> ticks; adds up exactly to lost
+    rule: str | None = None        # the anti-pattern rule, when one applies
+    top: str | None = None         # largest cause (differs from name when MIXED)
+
+
+@dataclass
 class Attribution:
     split: View = field(default_factory=View)            # READY split across allowed CPUs
     own: View = field(default_factory=View)              # READY charged to the queued-on CPU
     ready: Counter = field(default_factory=Counter)      # phase -> ticks the holder was READY
     holder_prio: dict = field(default_factory=dict)      # phase -> holder priority (last seen)
+    cause: Cause | None = None                           # from the own view (primary)
+    cause_split: Cause | None = None                     # from the split view (context only)
 
 
 def share_label(run: Running | None, holder_prio: int | None, isr: set[Key]) -> str:
@@ -194,7 +231,7 @@ def share_label(run: Running | None, holder_prio: int | None, isr: set[Key]) -> 
 
 def _charge(view: View, run: Running | None, label: str, amount) -> None:
     view.buckets[label] += amount
-    if label in PRIORITY_LABELS and run is not None:
+    if label in CULPRIT_LABELS and run is not None:
         view.culprits[(run[0], run[1], run[2], label)] += amount
 
 
@@ -238,10 +275,91 @@ def attribute(phases: list[tuple[str, int, int, Key | None]], tl: Timeline,
                 for c in cpus:
                     run = on(c)
                     _charge(a.split, run, share_label(run, hprio, tl.isr), share)
-                qc = tl.ready_cpu(holder, s0)
-                run = on(qc) if qc is not None else None
-                _charge(a.own, run, share_label(run, hprio, tl.isr) if qc is not None else "unknown",
-                        Fraction(dt))
+                rs = tl.ready_start(holder, s0)
+                if rs is None:
+                    _charge(a.own, None, "unknown", Fraction(dt))
+                    continue
+                t_ready, qc = rs
+                run = on(qc)
+                label = share_label(run, hprio, tl.isr)
+                if label == "lower" and tl.stayed(qc, t_ready, s0):
+                    label = WAKEUP          # still the thread that was there at the wake-up
+                _charge(a.own, run, label, Fraction(dt))
             else:
                 both(f"blocked:{state}", dt)
     return a
+
+
+# -- causes --
+#
+# A request's LOST time is its interval minus the time its holders were
+# running: the time it spent waiting. Each lost tick counts toward one cause:
+#
+#   priority inversion    the holder was READY behind a thread at or below the
+#                         CLIENT's priority that outranked the holder (or equalled
+#                         it while the holder was below the client). With the
+#                         client's priority the holder would have run. Rule 1 when
+#                         the request was handed off to a thread below the client.
+#   higher-priority load  behind a thread above the client's priority: legitimate
+#                         preemption; inheritance would not have helped.
+#   overload              behind an equal-priority thread at the client's priority:
+#                         too much work at that level, not a priority bug.
+#   not migrated          a lower-priority thread ran (see "lower" above).
+#   wake-up switch        own view only: the lower-priority thread that was running
+#                         on the holder's CPU when it was made ready ran on until the
+#                         switch. Measured: the replier after its MsgReply, ~0.5 us
+#                         per request (max 1.4 us, 21 demo traces).
+#   other                everything else: idle core, switching, interrupt
+#                         threads, blocked states, unknown priorities.
+#
+# The cause is the one with the largest share of the lost time, or "mixed"
+# when none reaches 50%. If the running time alone reaches the deadline, the
+# cause is "service time" instead: the work itself is too long.
+#
+# The PRIMARY cause comes from the own-CPU view, because QNX 8's documented
+# scheduling (no cross-CPU displacement) matches it (Marcus, 2026-11-20). The
+# split view is classified the same way and reported as context.
+
+INVERSION, LOAD, OVERLOAD, NOT_MIGRATED, OTHER = (
+    "priority inversion", "higher-priority load", "overload", "not migrated", "other")
+CAUSES = (INVERSION, LOAD, OVERLOAD, NOT_MIGRATED, WAKEUP, OTHER)   # report order
+SERVICE, MIXED = "service time", "mixed"
+RULE1 = "rule 1: priority inheritance lost at handoff"
+
+
+def culprit_cause(label: str, prio: int, client_prio: int) -> str:
+    """The cause one culprit's ticks count toward. label is relative to the holder."""
+    if label == WAKEUP:
+        return WAKEUP
+    if label == "lower":
+        return NOT_MIGRATED
+    if prio > client_prio:
+        return LOAD
+    if label == "higher" or prio < client_prio:   # "equal" below the client: holder < client
+        return INVERSION
+    return OVERLOAD
+
+
+def classify(view: View, interval: int, client_prio: int | None, deadline: Fraction | None,
+             handoff_below_client: bool) -> Cause:
+    """Name the cause of one request's lost time, from one view.
+
+    interval: the request's ticks (resp, or send when there is no release).
+    deadline: in ticks, or None. handoff_below_client: 101 and 102 came from
+    different threads of the server and the replier ran below the client.
+    """
+    running = view.buckets.get("running", 0)
+    lost = Fraction(interval) - running
+    by: Counter = Counter({c: Fraction(0) for c in CAUSES})
+    if client_prio is not None:
+        for (_, _, prio, label), ticks in view.culprits.items():
+            by[culprit_cause(label, prio, client_prio)] += ticks
+    by[OTHER] += lost - sum(by.values())          # the rest, so the causes add up to lost
+    top = max(CAUSES, key=lambda c: by[c])        # ties: the earlier in CAUSES
+    if deadline is not None and running >= deadline:
+        return Cause(SERVICE, Fraction(running) / interval if interval else Fraction(0),
+                     lost, dict(by), None, top)
+    share = by[top] / lost if lost > 0 else Fraction(0)
+    name = top if share >= Fraction(1, 2) else MIXED
+    rule = RULE1 if name == INVERSION and handoff_below_client else None
+    return Cause(name, share, lost, dict(by), rule, top)

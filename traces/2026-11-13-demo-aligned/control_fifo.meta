@@ -1,0 +1,6 @@
+scenario=control_fifo
+server_mode=inherit
+hog_prio=30
+options=--fifo
+cpus=all
+# written 2026-11-20 from run_demo.sh's fixed "all" list (unchanged since 76cbbc9), not by the capture itself

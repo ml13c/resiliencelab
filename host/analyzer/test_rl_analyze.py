@@ -250,7 +250,8 @@ class SyntheticCutOff(unittest.TestCase):
         code, out, err = run_main(text)
         self.assertEqual(code, 0)
         # reply_us, send_us, resp_us, ddl_us and late print as '-'
-        self.assertEqual(out.splitlines()[-1].split()[-7:], ["-", "-", "-", "-", "-", "cut", "off"])
+        row = next(ln for ln in out.splitlines() if ln.startswith("0:1 "))
+        self.assertEqual(row.split()[-7:], ["-", "-", "-", "-", "-", "cut", "off"])
         # Last event is THRECEIVE at t=534, last marker 102 at t=530: 4 ticks = 4 us.
         self.assertIn("note: req 0:1: cut off at trace end (missing 103); "
                       "the capture ended 4.0 us after marker 102", err)

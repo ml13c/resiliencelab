@@ -30,6 +30,16 @@ run_one() {
     mkdir -p $OUT
     rm -f $OUT/$name.*
     echo "== $name: server $mode, hog prio $hogprio $opts"
+    # Scenario metadata for the analyzer. cpus= is the set of cores the request's
+    # threads may use: the --cpu N passed to every role, else all. The analyzer
+    # reads <name>.meta next to <name>.txt instead of guessing from the trace.
+    cpus=all prev=""
+    for o in $opts; do
+        [ "$prev" = --cpu ] && cpus=$o
+        prev=$o
+    done
+    printf 'scenario=%s\nserver_mode=%s\nhog_prio=%s\noptions=%s\ncpus=%s\n' \
+        "$name" "$mode" "$hogprio" "$opts" "$cpus" > $OUT/$name.meta
 
     $B/rl_demo server $mode $opts > $OUT/$name.server.log 2>&1 &
     srv=$!

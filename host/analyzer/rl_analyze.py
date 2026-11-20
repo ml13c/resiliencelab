@@ -24,7 +24,10 @@ Two latencies per request:
          ready but not yet sending (e.g. behind equal-priority load).
          Requests with no sleep before them (the first one) are judged on send.
 
-Usage:  python rl_analyze.py <traceprinter.txt> [--json PATH | --json -]
+After the table: the autopsy (rl_autopsy.py). For each late request, where its
+time went and the cause, from the own-CPU view, with the split view in [brackets].
+
+Usage:  python rl_analyze.py <traceprinter.txt> [--json PATH | --json -] [--cpus LIST] [--autopsy]
 Exit:   0 = clean, 1 = warnings (printed to stderr), 2 = fatal (bad input).
         A request the capture ended before it finished gets status "cut off" and
         a note on stderr; that alone is not a warning.
@@ -39,9 +42,10 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Iterable, Iterator, NamedTuple
 
-from rl_autopsy import Attribution, Timeline, attribute
+from rl_autopsy import CAUSES, Attribution, Cause, Timeline, View, attribute, classify
 
 # Marker codes, mirroring the enum in target/ipc_probe/ipc_probe.cpp.
 REQ_START, SRV_GOT, SRV_REPLY, REQ_END = 100, 101, 102, 103
@@ -605,7 +609,8 @@ def resolve_cpus(spec: str | None, trace_path: str | None, header: dict[str, str
         meta = os.path.splitext(trace_path)[0] + ".meta"
         if os.path.exists(meta):
             with open(meta, encoding="utf-8") as f:
-                kv = dict(ln.split("=", 1) for ln in f.read().splitlines() if "=" in ln)
+                kv = dict(ln.split("=", 1) for ln in f.read().splitlines()
+                          if "=" in ln and not ln.startswith("#"))
             spec, source = kv.get("cpus", "").strip() or None, f"from {os.path.basename(meta)}"
             if spec is None:
                 raise TraceError(f"{meta} has no cpus= line")
@@ -640,13 +645,39 @@ def phases_of(r: Row) -> list[tuple[str, int, int, ThreadKey | None]] | None:
             ("reply", t[SRV_REPLY], t[REQ_END], key(REQ_START))]
 
 
+def handoff(r: Row) -> bool:
+    """101 and 102 from different threads of one process: the receive thread
+    handed the request to another thread (rule 1's shape)."""
+    srv, rep = r.thread(SRV_GOT), r.thread(SRV_REPLY)
+    return bool(srv and rep and srv.pid == rep.pid and srv.tid != rep.tid)
+
+
+def handoff_below_client(r: Row) -> bool:
+    """A handoff to a thread the kernel ran below the client's priority:
+    the client's priority was not passed on (rule 1)."""
+    rep, cl = r.thread(SRV_REPLY), r.thread(REQ_START)
+    return (handoff(r) and cl is not None and rep.prio is not None and cl.prio is not None
+            and rep.prio < cl.prio)
+
+
 def run_autopsy(res: Result, cpus: list[int], source: str) -> None:
-    """Attribute every completed request's time (see rl_autopsy)."""
+    """Attribute every completed request's time and name its cause (see rl_autopsy).
+
+    Every completed request gets a cause, on time or not, so a slow on-time
+    request can be explained too; the summary counts only the late ones.
+    """
     res.cpus, res.cpus_source = cpus, source
     for r in res.rows:
         ph = phases_of(r)
-        if ph is not None:
-            r.autopsy = attribute(ph, res.timeline, cpus)
+        if ph is None:
+            continue
+        a = r.autopsy = attribute(ph, res.timeline, cpus)
+        interval = r.resp if r.release is not None else r.total   # what the phases cover
+        client = r.thread(REQ_START)
+        deadline = Fraction(r.deadline_us * res.cps, 10**6) if r.deadline_us else None
+        args = (interval, client.prio if client else None, deadline, handoff_below_client(r))
+        a.cause = classify(a.own, *args)
+        a.cause_split = classify(a.split, *args)
 
 
 def fmt_cpus(cpus: list[int]) -> str:
@@ -709,6 +740,95 @@ def print_table(res: Result, out=None) -> None:
         print(f"replies: {s['replies_correct']} correct, {s['replies_wrong']} wrong", file=out)
 
 
+def autopsy_summary(res: Result, top_n: int = 3) -> dict | None:
+    """Autopsy totals, shared by the table and the JSON. Ticks are exact Fractions.
+
+    Causes and lost time are over the LATE requests; READY time is over every
+    completed request (for runs with nothing late, e.g. the fixed scenarios).
+    """
+    if res.cpus is None:
+        return None
+    done = [r for r in res.rows if r.autopsy is not None]
+    late = [r for r in done if r.late]
+    lost = {"own": Counter(), "split": Counter()}
+    culprits: Counter = Counter()
+    for r in late:
+        a = r.autopsy
+        lost["own"].update(a.cause.by_cause)
+        lost["split"].update(a.cause_split.by_cause)
+        culprits.update(a.own.culprits)
+    ready = [sum(r.autopsy.ready.values(), Fraction(0)) for r in done]
+    return {
+        "completed": len(done),
+        "late": len(late),
+        "causes": Counter(r.autopsy.cause.name for r in late),
+        "causes_split": Counter(r.autopsy.cause_split.name for r in late),
+        "rules": Counter(r.autopsy.cause.rule for r in late if r.autopsy.cause.rule),
+        "lost": lost,
+        "top_culprits": culprits.most_common(top_n),
+        "ready_mean": sum(ready) / len(ready) if ready else None,
+        "ready_max": max(ready, default=None),
+    }
+
+
+def _pct(part, whole) -> str:
+    return f"{100 * part / whole:.1f}%" if whole else "-"
+
+
+def _culprit(res: Result, key: tuple, ticks) -> str:
+    pid, tid, prio, label = key
+    return f"{res.timeline.name((pid, tid))}@{prio} {label} {fmt_us(ticks, res.cps)} us"
+
+
+def _cause(c: Cause) -> str:
+    if c.name == "service time":
+        return f"service time (running {100 * c.share:.0f}% of the interval)"
+    if c.name == "mixed":
+        return f"mixed (largest: {c.top} {100 * c.share:.0f}%)"
+    return f"{c.name} {100 * c.share:.0f}%" + (f" ({c.rule})" if c.rule else "")
+
+
+def print_autopsy(res: Result, out=None, per_request: bool = False) -> None:
+    """Autopsy summary after the table. The own-CPU view is primary; the split
+    view's numbers follow in [brackets] as context."""
+    out = out or sys.stdout
+    s = autopsy_summary(res)
+    if s is None:
+        return
+    where = f"cpus {fmt_cpus(res.cpus)} ({res.cpus_source})"
+    if not s["late"]:
+        print(f"autopsy: no late requests; {where}", file=out)
+    else:
+        def counts(c: Counter) -> str:
+            return ", ".join(f"{k} {n}" for k, n in c.most_common())
+
+        rules = "".join(f"; {n} of them {k}" for k, n in s["rules"].items())
+        own, split = s["lost"]["own"], s["lost"]["split"]
+        total = sum(own.values(), Fraction(0))
+        shares = ", ".join(f"{c} {_pct(own[c], total)} [{_pct(split[c], total)}]"
+                           for c in CAUSES if own[c] or split[c])
+        print(f"autopsy: {s['late']} late requests, own-CPU view [split view]; {where}", file=out)
+        print(f"  causes:    {counts(s['causes'])}{rules}  [split: {counts(s['causes_split'])}]", file=out)
+        print(f"  lost time: {fmt_us(total, res.cps)} us = {shares}", file=out)
+        if s["top_culprits"]:
+            print("  culprits:  " + ", ".join(_culprit(res, k, v) for k, v in s["top_culprits"]),
+                  file=out)
+    if s["completed"]:
+        print(f"  holder READY time over {s['completed']} completed requests: "
+              f"mean {fmt_us(s['ready_mean'], res.cps)} us, max {fmt_us(s['ready_max'], res.cps)} us",
+              file=out)
+    if per_request:
+        for r in res.rows:
+            if not r.late or r.autopsy is None:
+                continue
+            a = r.autopsy
+            top = a.own.culprits.most_common(1)
+            print(f"  {r.label:<8}{'resp' if r.judged_from == 'release' else 'send'} {fmt_us(a.cause.lost + a.own.buckets['running'], res.cps)} us, "
+                  f"lost {fmt_us(a.cause.lost, res.cps)} us: {_cause(a.cause)}"
+                  + (f"; top {_culprit(res, *top[0])}" if top else "")
+                  + f"  [split: {_cause(a.cause_split)}]", file=out)
+
+
 def exit_code(res: Result) -> int:
     return 1 if res.warnings else 0
 
@@ -730,21 +850,69 @@ def summarize(res: Result) -> dict:
     }
 
 
-JSON_SCHEMA = "resiliencelab.analyze/0"   # bump when a field changes meaning or is removed
+# /1 (2026-11-20): per-request "autopsy", summary "autopsy". Nothing from /0 changed.
+JSON_SCHEMA = "resiliencelab.analyze/1"   # bump when a field changes meaning or is removed
+JSON_CULPRITS = 10                        # culprits listed per view and request
 
 
 def to_json(res: Result) -> dict:
     """Machine-readable result: for the HTML report, CI, and comparing runs.
 
-    Times appear twice: exact integer clock ticks (absolute timestamps and
-    intervals), and microseconds rounded to 0.1 for reading. Anything not
-    known is null.
+    Times appear twice: clock ticks (absolute timestamps and intervals), and
+    microseconds rounded to 0.1 for reading. Ticks are exact integers, except
+    autopsy shares in the split view, which can be fractions of a tick (dt/n,
+    given to 3 decimals). Anything not known is null.
     """
-    def us(ticks: int | None) -> float | None:
-        return None if ticks is None else round(ticks * 1e6 / res.cps, 1)
+    def us(ticks) -> float | None:
+        return None if ticks is None else round(float(ticks * 1e6 / res.cps), 1)
+
+    def tk(ticks) -> int | float:
+        return int(ticks) if Fraction(ticks).denominator == 1 else round(float(ticks), 3)
+
+    def amount(ticks) -> dict:
+        return {"ticks": tk(ticks), "us": us(ticks)}
 
     def thread(th: Thread | None) -> dict | None:
         return None if th is None else {"pid": th.pid, "tid": th.tid, "prio": th.prio}
+
+    def culprits(c: Counter, n: int) -> list[dict]:
+        return [{"pid": pid, "tid": tid, "prio": prio, "name": res.timeline.name((pid, tid)),
+                 "label": label, **amount(v)} for (pid, tid, prio, label), v in c.most_common(n)]
+
+    def view(v: View) -> dict:
+        return {"buckets": {k: amount(x) for k, x in sorted(v.buckets.items())},
+                "culprits": culprits(v.culprits, JSON_CULPRITS)}
+
+    def cause(c: Cause) -> dict:
+        return {"name": c.name, "share": round(float(c.share), 4), "rule": c.rule, "top": c.top,
+                "lost": amount(c.lost), "by_cause": {k: amount(c.by_cause[k]) for k in CAUSES}}
+
+    def autopsy(a: Attribution | None) -> dict | None:
+        if a is None:
+            return None
+        return {
+            "ready": {k: amount(v) for k, v in a.ready.items()},   # holder READY, per phase
+            "views": {"own": view(a.own), "split": view(a.split)},
+            "cause": cause(a.cause),               # primary: own-CPU view
+            "cause_split": cause(a.cause_split),   # context
+            # The holder waited while lower-priority work ran on another allowed CPU.
+            "not_migrated": amount(a.split.buckets.get("lower", 0)),
+        }
+
+    def summary_autopsy() -> dict | None:
+        s = autopsy_summary(res, JSON_CULPRITS)
+        if s is None:
+            return None
+        return {
+            "cpus": res.cpus, "cpus_source": res.cpus_source, "primary_view": "own",
+            "completed": s["completed"], "late": s["late"],
+            "causes": dict(s["causes"]), "causes_split": dict(s["causes_split"]),
+            "rules": dict(s["rules"]),
+            "lost": {v: {k: amount(s["lost"][v][k]) for k in CAUSES} for v in ("own", "split")},
+            "culprits": culprits(Counter(dict(s["top_culprits"])), JSON_CULPRITS),
+            "ready_mean": None if s["ready_mean"] is None else amount(s["ready_mean"]),
+            "ready_max": None if s["ready_max"] is None else amount(s["ready_max"]),
+        }
 
     def request(r: Row) -> dict:
         srv, rep = r.thread(SRV_GOT), r.thread(SRV_REPLY)
@@ -757,9 +925,7 @@ def to_json(res: Result) -> dict:
             "client": thread(r.thread(REQ_START) or r.thread(REQ_END)),
             "server": thread(srv),
             "replier": thread(rep),
-            # 101 and 102 from different threads of one process: the receive
-            # thread handed the request to another thread (rule 1's shape).
-            "handoff": bool(srv and rep and srv.pid == rep.pid and srv.tid != rep.tid),
+            "handoff": handoff(r),
             "release_t": r.release,
             "markers": {str(c): {"t": mk.t, "cpu": mk.cpu, "d1": mk.d1, "line": mk.lineno}
                         for c, mk in sorted(r.m.items())},
@@ -770,6 +936,7 @@ def to_json(res: Result) -> dict:
             "judged_from": r.judged_from,
             "reply_ok": {1: True, 2: False}.get(end_flag),
             "status": r.status,
+            "autopsy": autopsy(r.autopsy),
         }
 
     return {
@@ -781,6 +948,7 @@ def to_json(res: Result) -> dict:
         "markers": res.n_markers,
         "wraps_rebuilt": res.n_wraps,
         "summary": summarize(res),
+        "autopsy": summary_autopsy(),
         "requests": [request(r) for r in res.rows],
         "warnings": res.warnings,
         "notes": res.notes,
@@ -797,6 +965,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cpus", metavar="LIST",
                     help="CPUs the request's threads may run on, e.g. 0 or 0,2 or all "
                          "(default: <trace>.meta next to the trace, else all cores)")
+    ap.add_argument("--autopsy", action="store_true",
+                    help="also print one autopsy line per late request")
     args = ap.parse_args(argv)
     try:
         with open(args.trace, encoding="utf-8", errors="replace") as f:
@@ -810,6 +980,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
     else:
         print_table(res)
+        print_autopsy(res, per_request=args.autopsy)
         if args.json:
             try:
                 with open(args.json, "w", encoding="utf-8") as f:

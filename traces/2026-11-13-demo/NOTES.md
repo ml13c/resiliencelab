@@ -58,3 +58,6 @@ Notes on the table:
 
 ## Next
 Re-capture with the aligned hog and the RAM trace file. The client now also prints its release delay, because in the control the client itself may wait before marker 100. That wait is invisible to the trace interval.
+
+## Scenario metadata (added 2026-11-20)
+The `<name>.meta` files were written afterwards, not by this capture. They come from run_demo.sh's fixed `all` scenario list, which is unchanged since 76cbbc9. Only defect_cpu0 ran with `--cpu 0` (`cpus=0`); every other scenario has `cpus=all`. The logs agree: only defect_cpu0's server and hog logs say "(pinned)". The analyzer reads `cpus=` to decide which cores a request's threads may use.

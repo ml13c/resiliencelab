@@ -60,6 +60,15 @@ static void pin_self() {
         perror("ThreadCtl(_NTO_TCTL_RUNMASK)");
 }
 
+// " (pinned to CPU N)" for a startup line, or "" without --cpu. The logs then
+// record which core a run used, next to run_demo.sh's <name>.meta file.
+static const char* pin_note() {
+    static char buf[32];
+    if (g_cpu < 0) return "";
+    snprintf(buf, sizeof buf, " (pinned to CPU %d)", g_cpu);
+    return buf;
+}
+
 enum : int {
     EV_REQ_START = 100,
     EV_SRV_GOT   = 101,
@@ -209,7 +218,7 @@ static int run_server(Mode mode) {
     if (mode != Mode::Direct && start_worker() != 0) return 1;
     const char* mname = mode == Mode::Handoff ? "handoff" : mode == Mode::Inherit ? "inherit" : "direct";
     printf("server: pid %d priority %d, mode %s, listening as '%s'%s\n", getpid(), my_priority(),
-           mname, kName, g_cpu >= 0 ? " (pinned)" : "");
+           mname, kName, pin_note());
     fflush(stdout);
 
     RecvBuf msg;
@@ -440,7 +449,7 @@ static int run_hog(int threads, int prio, uint32_t busy_ms, uint32_t idle_ms, ui
     const uint64_t end_cyc   = start_cyc + cps * seconds;   // bounded: the hog always stops
     printf("hog: pid %d, %d thread(s) at priority %d %s, busy %u ms / idle %u ms, %s, for %u s%s\n",
            getpid(), threads, prio, fifo ? "FIFO" : "RR", busy_ms, idle_ms,
-           aligned ? "aligned" : "unaligned", seconds, g_cpu >= 0 ? " (pinned)" : "");
+           aligned ? "aligned" : "unaligned", seconds, pin_note());
     fflush(stdout);
 
     std::vector<pthread_t> tids(threads);

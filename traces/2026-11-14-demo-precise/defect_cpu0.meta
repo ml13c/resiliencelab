@@ -1,0 +1,6 @@
+scenario=defect_cpu0
+server_mode=handoff
+hog_prio=20
+options=--cpu 0
+cpus=0
+# written 2026-11-20 from run_demo.sh's fixed "all" list (unchanged since 76cbbc9), not by the capture itself

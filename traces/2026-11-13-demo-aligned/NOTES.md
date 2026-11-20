@@ -39,3 +39,6 @@ All runs: functional 200/200 correct, client exit 0. Every tracelogger log is em
 
 ## Next
 Capture 3, with TIMER_PRECISE sleeps and no in-loop printing. In the analyzer slice, measure lateness from the client's *release*: its THNANOSLEEP → THREADY transition in the kernel trace, before marker 100, so the control's pre-send wait counts.
+
+## Scenario metadata (added 2026-11-20)
+The `<name>.meta` files were written afterwards, not by this capture. They come from run_demo.sh's fixed `all` scenario list, which is unchanged since 76cbbc9. Only defect_cpu0 ran with `--cpu 0` (`cpus=0`); every other scenario has `cpus=all`. The logs agree: only defect_cpu0's server and hog logs say "(pinned)". The analyzer reads `cpus=` to decide which cores a request's threads may use.

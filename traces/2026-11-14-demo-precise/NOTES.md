@@ -49,3 +49,19 @@ Notes on the table:
 
 ## Next
 The kernel-event autopsy: attribute each late request's wait to the threads that ran instead.
+
+## Scenario metadata (added 2026-11-20)
+The `<name>.meta` files were written afterwards, not by this capture. They come from run_demo.sh's fixed `all` scenario list, which is unchanged since 76cbbc9. Only defect_cpu0 ran with `--cpu 0` (`cpus=0`); every other scenario has `cpus=all`. The logs agree: only defect_cpu0's server and hog logs say "(pinned)". The analyzer reads `cpus=` to decide which cores a request's threads may use.
+
+## Autopsy (analyzer, 2026-11-20)
+`python host\analyzer\rl_analyze.py <name>.txt`, CPUs from `<name>.meta`. The cause comes from the own-CPU view; the split view is in [brackets]. Lost time = response time minus the time the request's holders were running.
+
+| Scenario | Late | Cause (own view) | Lost time, share | Top culprit |
+|---|---|---|---|---|
+| defect_cpu0 | 175 | priority inversion 175, all rule 1 | 837 ms: inversion 99.3% [99.3%] | rl_demo/rl_hog0@20, 830 ms |
+| defect | 175 | priority inversion 175, all rule 1 | 867 ms: inversion 99.4% [99.4%] | rl_hog0/1/3@20, ~220-240 ms each |
+| control_rr | 126 | overload 126 | 304 ms: overload 98.9% [99.1%] | rl_hog2@30, 86 ms |
+| control_fifo | 148 | overload 148 | 688 ms: overload 99.3% [99.4%] | rl_hog0@30, 188 ms |
+| fixed / fixed_direct / baseline | 0 | - | - | holder READY mean 8.0 / 5.2 / 4.5 us per request |
+
+Every request's buckets add up exactly to its interval, in both views.

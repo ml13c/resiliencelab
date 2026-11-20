@@ -1,0 +1,6 @@
+scenario=baseline
+server_mode=handoff
+hog_prio=0
+options=
+cpus=all
+# written 2026-11-20 from run_demo.sh's fixed "all" list (unchanged since 76cbbc9), not by the capture itself
